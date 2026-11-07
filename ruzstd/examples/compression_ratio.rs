@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use ruzstd::encoding::{compress_to_vec, CompressionLevel};
+use zstd_rust::encoding::{compress_to_vec, CompressionLevel};
 
 const ITERATIONS: usize = 50;
 

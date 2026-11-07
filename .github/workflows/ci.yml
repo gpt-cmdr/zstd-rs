@@ -82,3 +82,27 @@ jobs:
           name: fuzz-artifacts-${{ matrix.target }}
           path: ruzstd/fuzz/artifacts/${{ matrix.target }}
           if-no-files-found: ignore
+
+  package:
+    name: package, docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: The crate's LICENSE and Readme.md are copies of the top-level files
+        run: cmp LICENSE ruzstd/LICENSE && cmp Readme.md ruzstd/Readme.md
+
+      - name: Docs
+        run: cargo doc -p zstd-rust --no-deps --features dict_builder
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Package contents
+        run: cargo package -p zstd-rust --list
+
+      - name: Publish dry run
+        run: cargo publish -p zstd-rust --dry-run

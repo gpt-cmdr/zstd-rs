@@ -1,24 +1,67 @@
-# Ruzstd (a pure rust zstd format implementation)
+# zstd-rust (a pure Rust zstd implementation)
 
-> **This is the gpt-cmdr fork of `ruzstd`.** Its `main` branch is upstream `master` plus a faster and smaller
-> compressor: the `Default`, `Better` and `Best` levels and compressor dictionaries from the upstream pull request
-> 132 ("Implement Default, Better and Best compression levels", by AlexNitrov, MIT like this crate), repeat offset
-> codes, frequency-based Huffman tables, a rewritten FSE encoder with per-block table selection, and matchers
-> modelled on the reference implementation's `fast` and `dfast` strategies. See `Changelog.md` for the details.
-> The `master` branch tracks upstream.
+[![API docs](https://docs.rs/zstd-rust/badge.svg)](https://docs.rs/zstd-rust)
+[![CI](https://github.com/gpt-cmdr/zstd-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gpt-cmdr/zstd-rs/actions/workflows/ci.yml)
 
-[![Released API docs](https://docs.rs/ruzstd/badge.svg)](https://docs.rs/ruzstd)
-[![CI](https://github.com/killingspark/zstd-rs/workflows/CI/badge.svg)](https://github.com/killingspark/zstd-rs/actions?query=workflow%3ACI)
+A pure Rust implementation of the Zstandard compression format, as defined in
+[RFC8878](https://www.rfc-editor.org/rfc/rfc8878.pdf): a complete decoder and a compressor with four levels. It
+works in `no_std` environments with `alloc`.
 
+**`zstd-rust` is an independently maintained fork of [`ruzstd`](https://crates.io/crates/ruzstd).** It is
+maintained by William Katzenmeyer / CLB Engineering Corporation at <https://github.com/gpt-cmdr/zstd-rs> and is
+**not affiliated with or endorsed by the `ruzstd` project or its authors**. Please report problems with this crate
+here, not to `ruzstd`.
 
-# What is this
+Version 0.1.0 is `ruzstd`'s `master` branch at commit `91a3a6e` (after the `ruzstd` 0.9.1 release) plus the
+compressor work listed below. The decoder is `ruzstd`'s. See `Changelog.md` for the details.
 
-A pure Rust implementation of the Zstandard compression format, as defined in [RFC8878](https://www.rfc-editor.org/rfc/rfc8878.pdf).
+## What it adds to `ruzstd` 0.9.1
 
-This crate contains a fully operational implementation of the decompression portion of the standard.
-It also provides a compressor which is usable, but it does not yet reach the speed, ratio or configurability of the original zstd library.
+- The `Default`, `Better` and `Best` compression levels (`ruzstd` 0.9.1 implements `Uncompressed` and `Fastest`
+  only) and dictionaries for the compressor, written by Alex Nitrov (AlexNitrov), MIT licensed like the rest of the
+  crate; his commits keep their authorship in the history.
+- Matchers modelled on the reference implementation's `fast` (`Fastest`) and `dfast` (`Default`) strategies;
+  `Better` and `Best` use hash chains with lazy matching.
+- Repeat offset codes, searched by every level.
+- Huffman tables for literals built from the symbol frequencies.
+- A rewritten FSE encoder that chooses the predefined, RLE, repeated or a new table per field and block by cost.
 
-This crate is currently actively maintained.
+Measured on 18,376 GeoParquet pages (323 MB) and 125 512x512 float32 GeoTIFF tiles (131 MB), each page or tile
+compressed as its own frame, against the reference implementation (libzstd 1.5.7 through the `zstd` crate) on the
+same data. Every frame was decoded by both libzstd and this crate and compared with the input.
+
+| Encoder | total size | vs zstd -1 | vs zstd -3 | speed |
+|---|---:|---:|---:|---:|
+| zstd -1 (C) | 128,280,067 | | +7.5 % | |
+| zstd -3 (C) | 119,372,863 | -6.9 % | | |
+| `ruzstd` 0.9.1 `Fastest` | 163,787,361 | +27.7 % | +37.2 % | |
+| `zstd-rust` 0.1.0 `Fastest` | 122,526,278 | **-4.5 %** | +2.6 % | about 0.5x zstd -1 |
+| `zstd-rust` 0.1.0 `Default` | 119,929,229 | -6.5 % | **+0.5 %** | about 0.5x zstd -3 |
+
+`Better` is 3.7 % smaller than zstd -3 on the same data at about a tenth of its speed, `Best` slower still. The
+per-data-set numbers are under [Compression](#compression).
+
+## Using it
+
+```toml
+[dependencies]
+zstd-rust = "0.1"
+```
+
+The library is called `zstd_rust` (`use zstd_rust::encoding::compress_to_vec;`). Code written for `ruzstd` can keep
+its `ruzstd::` paths by renaming the dependency:
+
+```toml
+[dependencies]
+ruzstd = { package = "zstd-rust", version = "0.1" }
+```
+
+The public API is `ruzstd`'s, with the additions in the Changelog.
+
+## Credits
+
+`ruzstd` was written by Moritz Borcherding with its contributors; their copyright and MIT licence are kept in
+`LICENSE`. The compression levels and compressor dictionaries this fork builds on are by Alex Nitrov.
 
 # Current Status
 
@@ -26,13 +69,13 @@ This crate is currently actively maintained.
 The `decoding` module provides a complete
 implementation of a Zstandard decompressor.
 
-In terms of speed, `ruzstd` is behind the original C implementation
+In terms of speed, the decoder is behind the original C implementation
 which has a rust binding located [here](https://github.com/gyscos/zstd-rs).
 
-Measuring with the 'time' utility the original zstd and my decoder both
-decoding the same enwik9.zst file from a ramfs, my decoder is about 3.5
+As measured by the `ruzstd` author with the 'time' utility, the original zstd and this decoder both
+decoding the same enwik9.zst file from a ramfs, this decoder is about 3.5
 times slower. Enwik9 is highly compressible, for less compressible data
-(like a ubuntu installation .iso) my decoder comes close to only being
+(like a ubuntu installation .iso) it comes close to only being
 1.4 times slower.
 
 ## Compression
@@ -101,7 +144,7 @@ for clarification.
 The easiest is to use the provided `compress`/`compress_to_vec` functions
 
 ```rust, no_run
-use ruzstd::encoding::{compress, compress_to_vec, CompressionLevel};
+use zstd_rust::encoding::{compress, compress_to_vec, CompressionLevel};
 let data: &[u8] = todo!();
 // Either
 let mut compressed = Vec::new();
@@ -119,7 +162,7 @@ Both dictionaries in the zstd dictionary format (as created by `zstd --train` or
 raw content dictionaries (arbitrary bytes) are supported. The decoder needs the same dictionary.
 
 ```rust, no_run
-use ruzstd::encoding::{FrameCompressor, CompressionLevel, Dictionary};
+use zstd_rust::encoding::{FrameCompressor, CompressionLevel, Dictionary};
 let raw_dictionary: &[u8] = todo!("read the dictionary file");
 let dictionary = Dictionary::parse(raw_dictionary).unwrap();
 // Reuse one compressor for many inputs, loading the dictionary is only done once
@@ -136,7 +179,7 @@ for input in [b"first input".as_slice(), b"second input".as_slice()] {
 
 Frames compressed with a dictionary in the zstd format carry its ID, so `FrameDecoder::add_dict` is enough on
 the decoding side. Raw content dictionaries have no ID, register one with
-`ruzstd::decoding::Dictionary::from_raw_content` and select it with `FrameDecoder::force_dict` after
+`zstd_rust::decoding::Dictionary::from_raw_content` and select it with `FrameDecoder::force_dict` after
 initializing the decoder for a frame. The specification only allows references into the dictionary while the
 frame holds at most `window_size` bytes, which is 512 KiB for `Fastest` and 2 MiB for `Default`.
 
@@ -149,8 +192,8 @@ Additionally to the descriptions and the docs you can have a look at the zstd / 
 The easiest is to wrap the io::Read into a StreamingDecoder which itself implements io::Read. It will decode blocks as necessary to fulfill the read requests
 
 ```rust, no_run
-use ruzstd::decoding::StreamingDecoder;
-use ruzstd::io::Read;
+use zstd_rust::decoding::StreamingDecoder;
+use zstd_rust::io::Read;
 
 let mut source: &[u8] = todo!("Get a reader from a File or any other source");
 let mut decoder = StreamingDecoder::new(&mut source).unwrap();
@@ -204,11 +247,9 @@ Fuzzing has been done on
 Use `cargo +nightly fuzz run decode` or some other fuzz target to run the fuzzer. It is seeded with files created with decodecorpus.
 
 If the fuzzer finds a crash it will be saved to the artifacts dir by the fuzzer. Run `cargo test artifacts` to run the artifacts tests.
-This will tell you where the decoder panics exactly. If you are able to fix the issue please feel free to do a pull request. If not please still submit the offending input and I will see how to fix it myself.
+This will tell you where the decoder panics exactly. If you are able to fix the issue please feel free to do a pull request. If not, please open an issue with the offending input.
 
 # Contributing
 
-Contributions will be published under the same MIT license as this project. Please make an entry in the Changelog.md file when you make a PR.
-
-## AI Contributions
-Contributions may be created by using whatever tools you like. They must be read, verified and decided to be a value added to the project by a human (you! not a maintainer) before submitting a PR and the communication about the PR must be handled by a human and not an agent. This is meant to be more or less in the spirit of the [LLVM policy](https://llvm.org/docs/AIToolPolicy.html) adapted to a much smaller project.
+Issues and pull requests for this fork go to <https://github.com/gpt-cmdr/zstd-rs>. Contributions are published
+under the same MIT license as this project. Please make an entry in the Changelog.md file when you make a PR.

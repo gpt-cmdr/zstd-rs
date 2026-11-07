@@ -2,11 +2,22 @@
 
 This document records the changes made between versions, starting with version 0.5.0
 
-# gpt-cmdr fork (`main`)
+# zstd-rust 0.1.0
 
-The fork's `main` branch is upstream `master` plus the following. The first commits ("Implement Default, Better and
-Best compression levels with a lazy hash-chain matcher" and "Add dictionary support to the compressor") are the
-upstream pull request 132 by AlexNitrov, taken unchanged with their authorship (MIT, like this crate).
+First release under the name `zstd-rust` (library name `zstd_rust`), an independently maintained fork of `ruzstd`,
+not affiliated with the `ruzstd` project. It is `ruzstd`'s `master` branch at commit
+`91a3a6eb4cb8a0252ef73f5a561e30c790635774` (after the `ruzstd` 0.9.1 release; its manifest said 0.9.2, unreleased) plus
+the changes below. Everything under "After 0.9.1" is part of this release too.
+
+* Package renamed to `zstd-rust`, library to `zstd_rust`; `ruzstd = { package = "zstd-rust", version = "0.1" }` keeps
+  `ruzstd::` paths in dependent code. Repository, homepage and documentation point to the fork
+* `LICENSE` keeps the `ruzstd` copyright and adds the fork's; the crate directory carries real copies of `LICENSE`
+  and `Readme.md` instead of symbolic links, so the package is the same when built on a host without symlinks
+* The command line tool (`ruzstd-cli`) is not published
+
+The first commits ("Implement Default, Better and Best compression levels with a lazy hash-chain matcher" and "Add
+dictionary support to the compressor") are by Alex Nitrov, taken unchanged with their authorship (MIT, like this
+crate). On top of them:
 
 * `Fastest` matches with one hash table of 6-byte prefixes over a 512 KiB window, `Default` with a table of 8-byte and
   one of 5-byte prefixes over 2 MiB (both greedy, like the reference implementation's `fast` and `dfast`
