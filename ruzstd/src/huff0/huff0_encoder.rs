@@ -104,35 +104,30 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     }
 
     pub(super) fn weights(&self) -> Vec<u8> {
-        let max = self.table.codes.iter().map(|(_, nb)| nb).max().unwrap();
-        let weights = self
-            .table
-            .codes
-            .iter()
-            .copied()
-            .map(|(_, nb)| if nb == 0 { 0 } else { max - nb + 1 })
-            .collect::<Vec<u8>>();
-
-        weights
+        table_weights(self.table)
     }
 
     fn write_table(&mut self) {
         // TODO strategy for determining this?
         let weights = self.weights();
         let weights = &weights[..weights.len() - 1]; // dont encode last weight
-        if weights.len() > 16 {
+        let mut direct = weights.len() <= 16;
+        if !direct {
             let size_idx = self.writer.index();
             self.writer.write_bits(0u8, 8);
             let idx_before = self.writer.index();
-            let mut encoder = FSEEncoder::new(
-                fse_encoder::build_table_from_data(weights.iter().copied(), 6, true),
-                self.writer,
-            );
-            encoder.encode_interleaved(weights);
+            fse_compress_weights(weights, self.writer);
             let encoded_len = (self.writer.index() - idx_before) / 8;
-            assert!(encoded_len < 128);
-            self.writer.change_bits(size_idx, encoded_len as u8, 8);
-        } else {
+            if encoded_len < 128 {
+                self.writer.change_bits(size_idx, encoded_len as u8, 8);
+            } else {
+                // Too long for the header, callers check `can_be_described` so the weights can be written directly
+                assert!(weights.len() <= 128);
+                self.writer.reset_to(size_idx);
+                direct = true;
+            }
+        }
+        if direct {
             self.writer.write_bits(weights.len() as u8 + 127, 8);
             let pairs = weights.chunks_exact(2);
             let remainder = pairs.remainder();
@@ -170,27 +165,32 @@ impl HuffmanTable {
         Self::build_from_counts(&counts[..=max as usize])
     }
 
+    /// Build an optimal prefix code for symbols with the given counts, limited to the maximum code length of the
+    /// format. Symbols with a count of zero get no code. At least two symbols must have a nonzero count.
     pub fn build_from_counts(counts: &[usize]) -> Self {
         assert!(counts.len() <= 256);
-        let zeros = counts.iter().filter(|x| **x == 0).count();
-        let mut weights = distribute_weights(counts.len() - zeros);
-        let limit = weights.len().ilog2() as usize + 2;
-        redistribute_weights(&mut weights, limit);
+        let lengths = code_lengths(counts, MAX_CODE_LEN);
+        let max = lengths.iter().copied().max().unwrap() as usize;
+        let weights = lengths
+            .iter()
+            .map(|&len| if len == 0 { 0 } else { max + 1 - len as usize })
+            .collect::<Vec<_>>();
+        Self::build_from_weights(&weights)
+    }
 
-        weights.reverse();
-        let mut counts_sorted = counts.iter().enumerate().collect::<Vec<_>>();
-        counts_sorted.sort_by_key(|(_, c1)| *c1);
-
-        let mut weights_distributed = alloc::vec![0; counts.len()];
-        for (idx, count) in counts_sorted {
-            if *count == 0 {
-                weights_distributed[idx] = 0;
-            } else {
-                weights_distributed[idx] = weights.pop().unwrap();
-            }
+    /// Whether the description of this table fits into a literals section header. The weights are FSE compressed
+    /// into at most 127 bytes, or written directly if there are at most 128 of them.
+    pub(crate) fn can_be_described(&self) -> bool {
+        let weights = table_weights(self);
+        let weights = &weights[..weights.len() - 1];
+        if weights.len() <= 128 {
+            return true;
         }
-
-        Self::build_from_weights(&weights_distributed)
+        let mut scratch = Vec::new();
+        let mut writer = BitWriter::from(&mut scratch);
+        fse_compress_weights(weights, &mut writer);
+        writer.flush();
+        scratch.len() < 128
     }
 
     pub fn build_from_weights(weights: &[usize]) -> Self {
@@ -273,6 +273,120 @@ fn highest_bit_set(x: usize) -> usize {
     usize::BITS as usize - x.leading_zeros() as usize
 }
 
+/// The weights of the symbols of a table as they are written into the table description
+fn table_weights(table: &HuffmanTable) -> Vec<u8> {
+    let max = table.codes.iter().map(|(_, nb)| nb).max().unwrap();
+    table
+        .codes
+        .iter()
+        .copied()
+        .map(|(_, nb)| if nb == 0 { 0 } else { max - nb + 1 })
+        .collect::<Vec<u8>>()
+}
+
+/// FSE compress the weights of a table description (without the header byte)
+fn fse_compress_weights<V: AsMut<Vec<u8>>>(weights: &[u8], writer: &mut BitWriter<V>) {
+    let mut encoder = FSEEncoder::new(
+        fse_encoder::build_table_from_data(weights.iter().copied(), 6, true),
+        writer,
+    );
+    encoder.encode_interleaved(weights);
+}
+
+/// The maximum length of a Huffman code in Zstandard
+const MAX_CODE_LEN: u8 = 11;
+
+/// Lengths of an optimal prefix code (Huffman code) for symbols with the given counts, with no code longer than
+/// `max_len` bits. Symbols with a count of zero get the length 0. The code is complete (its Kraft sum is exactly 1),
+/// which the table description of the format requires.
+///
+/// The code is built with the two-queue variant of Huffman's algorithm. If it is too deep the long codes are cut to
+/// `max_len`, the codes of the least frequent symbols that are still shorter are lengthened until the code is a
+/// valid prefix code again, and the space that is left is used to shorten the codes of the most frequent symbols.
+fn code_lengths(counts: &[usize], max_len: u8) -> Vec<u8> {
+    // (count, symbol) of all used symbols, least frequent first
+    let mut leaves: Vec<(usize, usize)> = counts
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, count)| *count > 0)
+        .map(|(symbol, count)| (count, symbol))
+        .collect();
+    assert!(
+        leaves.len() >= 2,
+        "a Huffman code needs at least two symbols"
+    );
+    assert!(leaves.len() <= 1 << max_len);
+    leaves.sort_unstable();
+    let n = leaves.len();
+
+    // Nodes 0..n are the leaves, the following ones the inner nodes in the order they are created. Their weights do
+    // not decrease, so the two lightest nodes are always at the front of one of the two queues.
+    let mut weight: Vec<usize> = leaves.iter().map(|(count, _)| *count).collect();
+    weight.reserve(n - 1);
+    let mut parent = alloc::vec![0usize; 2 * n - 1];
+    let mut next_leaf = 0;
+    let mut next_inner = n;
+    let mut take_lightest = |weight: &[usize]| {
+        if next_leaf < n && (next_inner == weight.len() || weight[next_leaf] <= weight[next_inner])
+        {
+            next_leaf += 1;
+            next_leaf - 1
+        } else {
+            next_inner += 1;
+            next_inner - 1
+        }
+    };
+    for _ in 0..n - 1 {
+        let a = take_lightest(&weight);
+        let b = take_lightest(&weight);
+        parent[a] = weight.len();
+        parent[b] = weight.len();
+        weight.push(weight[a] + weight[b]);
+    }
+    // A parent is always created after its children, so walking backwards from the root visits it first
+    let mut depth = alloc::vec![0u32; 2 * n - 1];
+    for node in (0..2 * n - 2).rev() {
+        depth[node] = depth[parent[node]] + 1;
+    }
+    let mut lengths = depth[..n].to_vec();
+
+    let max_len = u32::from(max_len);
+    if lengths[0] > max_len {
+        // The least frequent symbol has the longest code
+        let kraft_target = 1u64 << max_len;
+        for len in lengths.iter_mut() {
+            *len = (*len).min(max_len);
+        }
+        let mut kraft: u64 = lengths.iter().map(|len| 1u64 << (max_len - len)).sum();
+        while kraft > kraft_target {
+            for len in lengths.iter_mut() {
+                if *len < max_len {
+                    kraft -= 1 << (max_len - *len - 1);
+                    *len += 1;
+                    if kraft <= kraft_target {
+                        break;
+                    }
+                }
+            }
+        }
+        // Lengthening may have overshot, give the space back to the most frequent symbols
+        for len in lengths.iter_mut().rev() {
+            while *len > 1 && kraft + (1 << (max_len - *len)) <= kraft_target {
+                kraft += 1 << (max_len - *len);
+                *len -= 1;
+            }
+        }
+        debug_assert_eq!(kraft, kraft_target);
+    }
+
+    let mut by_symbol = alloc::vec![0u8; counts.len()];
+    for ((_, symbol), len) in leaves.iter().zip(lengths) {
+        by_symbol[*symbol] = len as u8;
+    }
+    by_symbol
+}
+
 #[test]
 fn huffman() {
     let table = HuffmanTable::build_from_weights(&[2, 2, 2, 1, 1]);
@@ -289,159 +403,6 @@ fn huffman() {
     assert_eq!(table.codes[3], (0, 0));
     assert_eq!(table.codes[4], (0, 4));
     assert_eq!(table.codes[5], (1, 4));
-}
-
-/// Distributes weights that add up to a clean power of two
-fn distribute_weights(amount: usize) -> Vec<usize> {
-    assert!(amount >= 2);
-    assert!(amount <= 256);
-    let mut weights = Vec::new();
-
-    // This is the trivial power of two we always need
-    weights.push(1);
-    weights.push(1);
-
-    // This is the weight we are adding right now
-    let mut target_weight = 1;
-    // Counts how many times we have added weights
-    let mut weight_counter = 2;
-
-    // We always add a power of 2 new weights so that the weights that we add equal
-    // the weights are already in the vec if raised to the power of two.
-    // This means we double the weights in the vec -> results in a new power of two
-    //
-    // Example: [1, 1]      -> [1,1,2]       (2^1 + 2^1 == 2^2)
-    //
-    // Example: [1, 1]      -> [1,1,1,1]     (2^1 + 2^1 == 2^1 + 2^1)
-    //          [1,1,1,1]   -> [1,1,1,1,3]   (2^1 + 2^1 + 2^1 + 2^1 == 2^3)
-    while weights.len() < amount {
-        let mut add_new = 1 << (weight_counter - target_weight);
-        let available_space = amount - weights.len();
-
-        // If the amount of new weights needed to get to the next power of two would exceed amount
-        // We instead add 1 of a bigger weight and start the cycle again
-        if add_new > available_space {
-            // TODO we could maybe instead do this until add_new <= available_space?
-            //  target_weight += 1
-            //  add_new /= 2
-            target_weight = weight_counter;
-            add_new = 1;
-        }
-
-        for _ in 0..add_new {
-            weights.push(target_weight);
-        }
-        weight_counter += 1;
-    }
-
-    assert_eq!(amount, weights.len());
-
-    weights
-}
-
-/// Sometimes distribute_weights generates weights that require too many bits to encode
-/// This redistributes the weights to have less variance by raising the lower weights while still maintaining the
-/// required attributes of the weight distribution
-fn redistribute_weights(weights: &mut [usize], max_num_bits: usize) {
-    let weight_sum_log = weights
-        .iter()
-        .copied()
-        .map(|x| 1 << x)
-        .sum::<usize>()
-        .ilog2() as usize;
-
-    // Nothing needs to be done, this is already fine
-    if weight_sum_log < max_num_bits {
-        return;
-    }
-
-    // We need to decrease the weight difference by the difference between weight_sum_log and max_num_bits
-    let decrease_weights_by = weight_sum_log - max_num_bits + 1;
-
-    // To do that we raise the lower weights up by that difference, recording how much weight we added in the process
-    let mut added_weights = 0;
-    for weight in weights.iter_mut() {
-        if *weight < decrease_weights_by {
-            for add in *weight..decrease_weights_by {
-                added_weights += 1 << add;
-            }
-            *weight = decrease_weights_by;
-        }
-    }
-
-    // Then we reduce weights until the added weights are equaled out
-    while added_weights > 0 {
-        // Find the highest weight that is still lower or equal to the added weight
-        let mut current_idx = 0;
-        let mut current_weight = 0;
-        for (idx, weight) in weights.iter().copied().enumerate() {
-            if 1 << (weight - 1) > added_weights {
-                break;
-            }
-            if weight > current_weight {
-                current_weight = weight;
-                current_idx = idx;
-            }
-        }
-
-        // Reduce that weight by 1
-        added_weights -= 1 << (current_weight - 1);
-        weights[current_idx] -= 1;
-    }
-
-    // At the end we normalize the weights so that they start at 1 again
-    if weights[0] > 1 {
-        let offset = weights[0] - 1;
-        for weight in weights.iter_mut() {
-            *weight -= offset;
-        }
-    }
-}
-
-#[test]
-fn weights() {
-    // assert_eq!(distribute_weights(5).as_slice(), &[1, 1, 2, 3, 4]);
-    for amount in 2..=256 {
-        let mut weights = distribute_weights(amount);
-        assert_eq!(weights.len(), amount);
-        let sum = weights
-            .iter()
-            .copied()
-            .map(|weight| 1 << weight)
-            .sum::<usize>();
-        assert!(sum.is_power_of_two());
-
-        for num_bit_limit in (amount.ilog2() as usize + 1)..=11 {
-            redistribute_weights(&mut weights, num_bit_limit);
-            let sum = weights
-                .iter()
-                .copied()
-                .map(|weight| 1 << weight)
-                .sum::<usize>();
-            assert!(sum.is_power_of_two());
-            assert!(
-                sum.ilog2() <= 11,
-                "Max bits too big: sum: {} {weights:?}",
-                sum
-            );
-
-            let codes = HuffmanTable::build_from_weights(&weights).codes;
-            for (code, num_bits) in codes.iter().copied() {
-                for (code2, num_bits2) in codes.iter().copied() {
-                    if num_bits == 0 || num_bits2 == 0 || (code, num_bits) == (code2, num_bits2) {
-                        continue;
-                    }
-                    if num_bits <= num_bits2 {
-                        let code2_shifted = code2 >> (num_bits2 - num_bits);
-                        assert_ne!(
-                            code, code2_shifted,
-                            "{code:b},{num_bits:} is prefix of {code2:b},{num_bits2:}"
-                        );
-                    }
-                }
-            }
-        }
-    }
 }
 
 #[test]
@@ -476,8 +437,151 @@ fn from_data() {
     let counts = &[3, 0, 4, 1, 5];
     let table = HuffmanTable::build_from_counts(counts).codes;
 
-    let data = &[0, 2, 4, 4, 0, 3, 2, 2, 0, 2];
+    // The same counts as above
+    let data = &[0, 2, 4, 4, 0, 3, 2, 2, 0, 2, 4, 4, 4];
     let table2 = HuffmanTable::build_from_data(data).codes;
 
     assert_eq!(table, table2);
+}
+
+#[cfg(test)]
+fn assert_valid_lengths(counts: &[usize], lengths: &[u8]) {
+    assert_eq!(counts.len(), lengths.len());
+    let mut kraft = 0u64;
+    for (count, len) in counts.iter().zip(lengths) {
+        assert_eq!(*count == 0, *len == 0, "only used symbols get a code");
+        assert!(*len <= MAX_CODE_LEN);
+        if *len > 0 {
+            kraft += 1 << (MAX_CODE_LEN - len);
+        }
+    }
+    assert_eq!(kraft, 1 << MAX_CODE_LEN, "the code must be complete");
+    for (c1, l1) in counts.iter().zip(lengths) {
+        for (c2, l2) in counts.iter().zip(lengths) {
+            if *c1 > 0 && *c2 > 0 && c1 < c2 {
+                assert!(
+                    l1 >= l2,
+                    "a less frequent symbol must not get a shorter code"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn code_lengths_are_optimal_without_limit() {
+    // Classic example: the Huffman code for these counts has lengths 1, 2, 3, 4, 4 (or an equivalent code)
+    let counts = [45, 13, 12, 16, 9, 5];
+    let lengths = code_lengths(&counts, MAX_CODE_LEN);
+    assert_valid_lengths(&counts, &lengths);
+    let bits: usize = counts
+        .iter()
+        .zip(&lengths)
+        .map(|(c, l)| c * *l as usize)
+        .sum();
+    assert_eq!(bits, 224);
+
+    // Uniform counts give a balanced code
+    let lengths = code_lengths(&[7; 256], MAX_CODE_LEN);
+    assert!(lengths.iter().all(|len| *len == 8));
+}
+
+#[test]
+fn code_lengths_respect_the_limit() {
+    // Fibonacci counts produce the deepest possible Huffman tree
+    let mut counts = alloc::vec![1usize, 1];
+    while counts.len() < 40 {
+        let next = counts[counts.len() - 1] + counts[counts.len() - 2];
+        counts.push(next);
+    }
+    let lengths = code_lengths(&counts, MAX_CODE_LEN);
+    assert_valid_lengths(&counts, &lengths);
+    assert_eq!(*lengths.iter().max().unwrap(), MAX_CODE_LEN);
+
+    // All 256 symbols, one of them very frequent, many rare
+    let mut counts = alloc::vec![1usize; 256];
+    counts[3] = 1_000_000;
+    counts[200] = 50_000;
+    let lengths = code_lengths(&counts, MAX_CODE_LEN);
+    assert_valid_lengths(&counts, &lengths);
+}
+
+#[test]
+fn code_lengths_of_random_counts() {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    for round in 0..300 {
+        let symbols = 2 + round % 255;
+        let mut counts = alloc::vec![0usize; symbols];
+        for count in counts.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Mostly skewed counts, some unused symbols
+            let shift = state % 20;
+            *count = if state % 7 < 1 {
+                0
+            } else {
+                (state >> 40) as usize >> shift
+            };
+        }
+        counts[0] = counts[0].max(1);
+        counts[symbols - 1] = counts[symbols - 1].max(1);
+        let lengths = code_lengths(&counts, MAX_CODE_LEN);
+        assert_valid_lengths(&counts, &lengths);
+
+        // Without hitting the limit a Huffman code is less than one bit per symbol above the entropy
+        if *lengths.iter().max().unwrap() < MAX_CODE_LEN {
+            let total: usize = counts.iter().sum();
+            let bits: f64 = counts
+                .iter()
+                .zip(&lengths)
+                .map(|(c, l)| (*c * *l as usize) as f64)
+                .sum();
+            let entropy: f64 = counts
+                .iter()
+                .filter(|c| **c > 0)
+                .map(|c| {
+                    let p = *c as f64 / total as f64;
+                    -(*c as f64) * libm_log2(p)
+                })
+                .sum();
+            assert!(
+                bits < entropy + total as f64,
+                "{} bits for an entropy of {}",
+                bits,
+                entropy
+            );
+        }
+
+        // The table built from the lengths is a prefix code
+        let codes = HuffmanTable::build_from_counts(&counts).codes;
+        for (i, (code, num_bits)) in codes.iter().copied().enumerate() {
+            assert_eq!(num_bits, lengths[i]);
+            for (code2, num_bits2) in codes.iter().copied() {
+                if num_bits == 0 || num_bits2 == 0 || (code, num_bits) == (code2, num_bits2) {
+                    continue;
+                }
+                if num_bits <= num_bits2 {
+                    assert_ne!(code, code2 >> (num_bits2 - num_bits));
+                }
+            }
+        }
+    }
+}
+
+/// log2 for the tests, which also run without `std`
+#[cfg(test)]
+fn libm_log2(x: f64) -> f64 {
+    // x is in (0, 1]: split into mantissa and exponent, then use a series for ln of the mantissa
+    let bits = x.to_bits();
+    let exponent = ((bits >> 52) & 0x7FF) as i64 - 1023;
+    let mantissa = f64::from_bits((bits & ((1 << 52) - 1)) | (1023 << 52));
+    let y = (mantissa - 1.0) / (mantissa + 1.0);
+    let mut term = y;
+    let mut sum = 0.0;
+    for k in 0..40 {
+        sum += term / (2 * k + 1) as f64;
+        term *= y * y;
+    }
+    exponent as f64 + 2.0 * sum / core::f64::consts::LN_2
 }

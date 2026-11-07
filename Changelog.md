@@ -5,6 +5,8 @@ This document records the changes made between versions, starting with version 0
 # After 0.9.1 (Current)
 
 * Apply the per-block decoded size limit to a block's literals, including blocks with no sequences
+* Build the Huffman tables for literals from the symbol frequencies (an optimal code limited to 11 bits) instead of from
+  the rank of each symbol only
 
 # After 0.9.0
 
