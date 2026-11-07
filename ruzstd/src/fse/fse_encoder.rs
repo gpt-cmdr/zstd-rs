@@ -42,8 +42,10 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
         self.write_table();
 
         let mut state = self.table.init_state(data[data.len() - 1]);
+        self.writer.flush_full_bytes();
         for x in data[0..data.len() - 1].iter().rev().copied() {
             self.table.encode(&mut state, x, self.writer);
+            self.writer.flush_full_bytes();
         }
         self.table.flush_state(&state, self.writer);
 
@@ -65,6 +67,7 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
         self.write_table();
 
         let table = &self.table;
+        self.writer.flush_full_bytes();
         let mut state_1 = table.init_state(data[data.len() - 1]);
         let mut state_2 = table.init_state(data[data.len() - 2]);
 
@@ -74,6 +77,7 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
         loop {
             table.encode(&mut state_1, data[idx + 1], self.writer);
             table.encode(&mut state_2, data[idx], self.writer);
+            self.writer.flush_full_bytes();
 
             if idx < 2 {
                 break;
@@ -85,6 +89,7 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
         // If odd we need to encode the last states transition and encode the final states in the flipped order
         if idx == 1 {
             table.encode(&mut state_1, data[0], self.writer);
+            self.writer.flush_full_bytes();
             table.flush_state(&state_2, self.writer);
             table.flush_state(&state_1, self.writer);
         } else {
@@ -147,7 +152,9 @@ impl FSETable {
         State(self.state_table[((value >> nb_bits) as i32 + tt.delta_find_state) as usize] as u32)
     }
 
-    /// Move to a state that decodes `symbol`, writing the bits the decoder needs to get back to the current state
+    /// Move to a state that decodes `symbol`, writing the bits the decoder needs to get back to the current state.
+    ///
+    /// Adds at most `acc_log` bits to the writer without flushing it, see [`BitWriter::add_bits`].
     #[inline(always)]
     pub(crate) fn encode<V: AsMut<Vec<u8>>>(
         &self,
@@ -157,7 +164,7 @@ impl FSETable {
     ) {
         let tt = self.transforms[symbol as usize];
         let nb_bits = (state.0 + tt.delta_nb_bits) >> 16;
-        writer.write_bits_64(u64::from(state.0 & ((1 << nb_bits) - 1)), nb_bits as usize);
+        writer.add_bits(u64::from(state.0 & ((1 << nb_bits) - 1)), nb_bits as usize);
         state.0 =
             self.state_table[((state.0 >> nb_bits) as i32 + tt.delta_find_state) as usize] as u32;
     }

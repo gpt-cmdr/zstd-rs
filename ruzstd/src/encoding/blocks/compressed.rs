@@ -379,6 +379,7 @@ fn encode_sequences_with(
 ) {
     let init = |table: Option<&FSETable>, symbol| table.map(|t| t.init_state(symbol));
     let last = sequences[sequences.len() - 1];
+    writer.flush_full_bytes();
     let mut ll_state = init(ll_table, last.ll_code);
     let mut ml_state = init(ml_table, last.ml_code);
     let mut of_state = init(of_table, last.of_code);
@@ -386,6 +387,7 @@ fn encode_sequences_with(
 
     // encode backwards so the decoder reads the first sequence first
     for seq in sequences[..sequences.len() - 1].iter().rev() {
+        // At most 7 bits are buffered here, and the three states add at most 26 (9 + 9 + 8)
         if let (Some(t), Some(s)) = (of_table, of_state.as_mut()) {
             t.encode(s, seq.of_code, writer);
         }
@@ -404,7 +406,9 @@ fn encode_sequences_with(
     };
     flush(ml_table, &ml_state, writer);
     flush(of_table, &of_state, writer);
+    writer.flush_full_bytes();
     flush(ll_table, &ll_state, writer);
+    writer.flush_full_bytes();
 
     let bits_to_fill = writer.misaligned();
     if bits_to_fill == 0 {
@@ -414,22 +418,27 @@ fn encode_sequences_with(
     }
 }
 
+/// Write the extra bits of a sequence and flush the writer. At most 33 bits may be buffered before (7 left over
+/// from the last flush and up to 26 bits of the three states).
 #[inline(always)]
 fn write_extra_bits(seq: &CodedSequence, writer: &mut BitWriter<&mut Vec<u8>>) {
-    let ll_bits = LL_BITS[seq.ll_code as usize];
-    let ml_bits = ML_BITS[seq.ml_code as usize];
-    let of_bits = seq.of_code;
-    writer.write_bits_64(
-        u64::from(seq.ll - LL_BASE[seq.ll_code as usize]),
-        ll_bits as usize,
-    );
-    writer.write_bits_64(
-        u64::from(seq.ml - ML_BASE[seq.ml_code as usize]),
-        ml_bits as usize,
-    );
-    writer.write_bits_64(u64::from(seq.of & ((1 << of_bits) - 1)), of_bits as usize);
+    let ll_bits = LL_BITS[seq.ll_code as usize] as usize;
+    let ml_bits = ML_BITS[seq.ml_code as usize] as usize;
+    let of_bits = seq.of_code as usize;
+    let extra = ll_bits + ml_bits + of_bits;
+    if extra > 30 {
+        writer.flush_full_bytes();
+    }
+    // At most 33 + 30 or 7 + 16 + 16 bits buffered after these two
+    writer.add_bits(u64::from(seq.ll - LL_BASE[seq.ll_code as usize]), ll_bits);
+    writer.add_bits(u64::from(seq.ml - ML_BASE[seq.ml_code as usize]), ml_bits);
+    if extra > 56 {
+        writer.flush_full_bytes();
+    }
+    // At most 7 + 31 or 7 + 56 bits buffered after this one
+    writer.add_bits(u64::from(seq.of & ((1 << of_bits) - 1)), of_bits);
+    writer.flush_full_bytes();
 }
-
 /// Number of extra bits of each literal length code (RFC 8878, section 3.1.1.3.2.1.1)
 const LL_BITS: [u8; 36] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11,

@@ -89,11 +89,25 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         writer: &mut BitWriter<VV>,
         data: &[u8],
     ) {
-        for symbol in data.iter().rev() {
-            let (code, num_bits) = table.codes[*symbol as usize];
-            debug_assert!(num_bits > 0);
-            writer.write_bits(code, num_bits as usize);
+        let codes = table.codes.as_slice();
+        writer.flush_full_bytes();
+        // Symbols are written from the last to the first. Codes have at most 11 bits, so four of them fit next to
+        // the at most 7 bits left over by a flush.
+        let (head, body) = data.split_at(data.len() % 4);
+        for chunk in body.rchunks_exact(4) {
+            for symbol in chunk.iter().rev() {
+                let (code, num_bits) = codes[*symbol as usize];
+                debug_assert!(num_bits > 0);
+                writer.add_bits(u64::from(code), num_bits as usize);
+            }
+            writer.flush_full_bytes();
         }
+        for symbol in head.iter().rev() {
+            let (code, num_bits) = codes[*symbol as usize];
+            debug_assert!(num_bits > 0);
+            writer.add_bits(u64::from(code), num_bits as usize);
+        }
+        writer.flush_full_bytes();
 
         let bits_to_fill = writer.misaligned();
         if bits_to_fill == 0 {

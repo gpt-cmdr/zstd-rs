@@ -188,6 +188,31 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         }
     }
 
+    /// Add bits to the internal buffer without moving anything to the output. The caller makes sure that no more
+    /// than 63 bits are buffered, by calling [`Self::flush_full_bytes`] often enough. `bits` *MUST* only contain
+    /// zeroes in the upper bits outside of the `0..num_bits` range.
+    #[inline(always)]
+    pub fn add_bits(&mut self, bits: u64, num_bits: usize) {
+        debug_assert!(self.bits_in_partial + num_bits <= 63);
+        debug_assert!(num_bits == 64 || bits >> num_bits == 0);
+        self.partial |= bits << self.bits_in_partial;
+        self.bits_in_partial += num_bits;
+    }
+
+    /// Move the complete bytes of the internal buffer to the output, leaving at most 7 bits buffered
+    #[inline(always)]
+    pub fn flush_full_bytes(&mut self) {
+        // At most 63 bits are buffered, see `add_bits`
+        let bytes = self.bits_in_partial >> 3;
+        let output = self.output.as_mut();
+        let len = output.len();
+        output.extend_from_slice(&self.partial.to_le_bytes());
+        output.truncate(len + bytes);
+        self.partial = self.partial.checked_shr(8 * bytes as u32).unwrap_or(0);
+        self.bits_in_partial &= 7;
+        self.bit_idx += 8 * bytes;
+    }
+
     /// Returns the populated buffer that you've been writing bits into.
     ///
     /// This function consumes the writer, so it cannot be used after
@@ -351,6 +376,35 @@ mod tests {
     fn catches_dirty_upper_bits() {
         let mut bw = BitWriter::new();
         bw.write_bits(10u8, 1);
+    }
+
+    #[test]
+    fn unflushed_bits_match_written_bits() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut values = vec![];
+        for _ in 0..1000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let n = (state % 25) as usize;
+            values.push(((state >> 20) & ((1 << n) - 1), n));
+        }
+        let mut reference = BitWriter::new();
+        let mut fast = BitWriter::new();
+        reference.write_bits(0b101u8, 3);
+        fast.write_bits(0b101u8, 3);
+        for chunk in values.chunks(2) {
+            for &(bits, n) in chunk {
+                reference.write_bits(bits, n);
+                fast.add_bits(bits, n);
+            }
+            fast.flush_full_bytes();
+            assert_eq!(fast.index(), reference.index());
+        }
+        let pad = reference.misaligned();
+        reference.write_bits(0u8, pad);
+        fast.write_bits(0u8, pad);
+        assert_eq!(fast.dump(), reference.dump());
     }
 
     #[test]
