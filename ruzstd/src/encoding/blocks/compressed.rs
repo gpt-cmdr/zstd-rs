@@ -9,24 +9,27 @@ use crate::{
 };
 
 /// A block of [`crate::common::BlockType::Compressed`]
-pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec<u8>) {
+///
+/// Returns the offset history after this block. The caller must store it in `state.offset_history` only if this
+/// block is actually emitted: if it is replaced by a raw block the decoder does not see these sequences.
+#[must_use]
+pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec<u8>) -> [u32; 3] {
     let mut literals_vec = Vec::new();
     let mut sequences = Vec::new();
-    state.matcher.start_matching(|seq| {
-        match seq {
-            Sequence::Literals { literals } => literals_vec.extend_from_slice(literals),
-            Sequence::Triple {
-                literals,
-                offset,
-                match_len,
-            } => {
-                literals_vec.extend_from_slice(literals);
-                sequences.push(crate::blocks::sequence_section::Sequence {
-                    ll: literals.len() as u32,
-                    ml: match_len as u32,
-                    of: (offset + 3) as u32, // TODO make use of the offset history
-                });
-            }
+    let mut offset_history = state.offset_history;
+    state.matcher.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => literals_vec.extend_from_slice(literals),
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => {
+            literals_vec.extend_from_slice(literals);
+            sequences.push(crate::blocks::sequence_section::Sequence {
+                ll: literals.len() as u32,
+                ml: match_len as u32,
+                of: encode_offset_value(offset as u32, literals.len() as u32, &mut offset_history),
+            });
         }
     });
 
@@ -96,6 +99,45 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
         }
     }
     writer.flush();
+    offset_history
+}
+
+/// Turns an actual match offset into the offset value written to the stream, using a repeat code when the offset is
+/// one of the three most recent ones, and updates `history` the way the decoder will (RFC 8878, section 3.1.2.5).
+///
+/// When the literal length is zero the repeat codes are shifted by one: 1 and 2 stand for the second and third
+/// recent offset and 3 for the most recent offset minus one.
+fn encode_offset_value(offset: u32, literal_len: u32, history: &mut [u32; 3]) -> u32 {
+    debug_assert!(offset > 0);
+    let [rep1, rep2, rep3] = *history;
+    if literal_len > 0 {
+        if offset == rep1 {
+            return 1;
+        }
+        if offset == rep2 {
+            *history = [rep2, rep1, rep3];
+            return 2;
+        }
+        if offset == rep3 {
+            *history = [rep3, rep1, rep2];
+            return 3;
+        }
+    } else {
+        if offset == rep2 {
+            *history = [rep2, rep1, rep3];
+            return 1;
+        }
+        if offset == rep3 {
+            *history = [rep3, rep1, rep2];
+            return 2;
+        }
+        if rep1 > 1 && offset == rep1 - 1 {
+            *history = [offset, rep1, rep2];
+            return 3;
+        }
+    }
+    *history = [offset, rep1, rep2];
+    offset + 3
 }
 
 #[derive(Clone)]
@@ -373,5 +415,47 @@ fn compress_literals(
         Some(new_encoder_table)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_offset_value;
+
+    #[test]
+    fn offset_values_follow_the_repeat_offset_rules() {
+        let mut history = [1, 4, 8];
+        // New offsets are shifted by 3 and pushed to the front
+        assert_eq!(encode_offset_value(100, 5, &mut history), 103);
+        assert_eq!(history, [100, 1, 4]);
+        // The most recent offset, with literals: code 1, history unchanged
+        assert_eq!(encode_offset_value(100, 2, &mut history), 1);
+        assert_eq!(history, [100, 1, 4]);
+        // The second and third recent offsets move to the front
+        assert_eq!(encode_offset_value(1, 1, &mut history), 2);
+        assert_eq!(history, [1, 100, 4]);
+        assert_eq!(encode_offset_value(4, 1, &mut history), 3);
+        assert_eq!(history, [4, 1, 100]);
+    }
+
+    #[test]
+    fn offset_values_without_literals_are_shifted() {
+        let mut history = [10, 20, 30];
+        // Without literals the most recent offset can not be repeated with a repeat code
+        assert_eq!(encode_offset_value(10, 0, &mut history), 13);
+        assert_eq!(history, [10, 10, 20]);
+        let mut history = [10, 20, 30];
+        assert_eq!(encode_offset_value(20, 0, &mut history), 1);
+        assert_eq!(history, [20, 10, 30]);
+        let mut history = [10, 20, 30];
+        assert_eq!(encode_offset_value(30, 0, &mut history), 2);
+        assert_eq!(history, [30, 10, 20]);
+        let mut history = [10, 20, 30];
+        assert_eq!(encode_offset_value(9, 0, &mut history), 3);
+        assert_eq!(history, [9, 10, 20]);
+        // The most recent offset minus one does not exist if that offset is 1
+        let mut history = [1, 20, 30];
+        assert_eq!(encode_offset_value(1, 0, &mut history), 4);
+        assert_eq!(history, [1, 1, 20]);
     }
 }
