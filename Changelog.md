@@ -2,6 +2,30 @@
 
 This document records the changes made between versions, starting with version 0.5.0
 
+# gpt-cmdr fork (`main`)
+
+The fork's `main` branch is upstream `master` plus the following. The first commits ("Implement Default, Better and
+Best compression levels with a lazy hash-chain matcher" and "Add dictionary support to the compressor") are the
+upstream pull request 132 by AlexNitrov, taken unchanged with their authorship (MIT, like this crate).
+
+* `Fastest` matches with one hash table of 6-byte prefixes over a 512 KiB window, `Default` with a table of 8-byte and
+  one of 5-byte prefixes over 2 MiB (both greedy, like the reference implementation's `fast` and `dfast`
+  strategies). `Better` and `Best` keep the hash chains with lazy matching. All levels share one matcher over a
+  contiguous window (`MatchGeneratorDriver` keeps its public interface).
+* All levels try the most recent offsets first, the greedy ones also take an immediate match at the second most
+  recent offset after each match
+* Table entries are absolute positions, so a reused compressor never clears its tables between frames
+* New `Matcher::source_size_hint` (with a default implementation). The frame compressor reads the first block
+  before writing the frame header; if it is the whole input the header states the content size (single segment)
+  and the matcher shrinks its window and tables to the input
+* `Matcher::get_next_space` may return an empty vector, which the compressor fills up to the block size
+* The FSE encoder uses the usual tANS tables (constant time per symbol), normalizes counts proportionally, and
+  chooses the predefined, RLE, repeated or a new table per field and block by estimated cost
+* Entropy tables and the offset history are only committed when a block is emitted as a compressed block; a block
+  that falls back to raw no longer leaves a Huffman table behind that the decoder never saw
+* Entropy-coded bits are flushed once per sequence or per four Huffman symbols instead of being checked per write
+* Compressed blocks are written straight into the output buffer
+
 # After 0.9.1 (Current)
 
 * Apply the per-block decoded size limit to a block's literals, including blocks with no sequences

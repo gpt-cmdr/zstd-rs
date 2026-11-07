@@ -1,5 +1,12 @@
 # Ruzstd (a pure rust zstd format implementation)
 
+> **This is the gpt-cmdr fork of `ruzstd`.** Its `main` branch is upstream `master` plus a faster and smaller
+> compressor: the `Default`, `Better` and `Best` levels and compressor dictionaries from the upstream pull request
+> 132 ("Implement Default, Better and Best compression levels", by AlexNitrov, MIT like this crate), repeat offset
+> codes, frequency-based Huffman tables, a rewritten FSE encoder with per-block table selection, and matchers
+> modelled on the reference implementation's `fast` and `dfast` strategies. See `Changelog.md` for the details.
+> The `master` branch tracks upstream.
+
 [![Released API docs](https://docs.rs/ruzstd/badge.svg)](https://docs.rs/ruzstd)
 [![CI](https://github.com/killingspark/zstd-rs/workflows/CI/badge.svg)](https://github.com/killingspark/zstd-rs/actions?query=workflow%3ACI)
 
@@ -32,54 +39,39 @@ times slower. Enwik9 is highly compressible, for less compressible data
 On the compression side:
 - Support for generating compressed blocks at any compression level
   - [x] Uncompressed
-  - [x] Fastest (roughly level 1): greedy single-slot hash matcher, window of one block (128 kB)
-  - [x] Default (roughly level 3): hash chains with lazy matching, 2 MiB window
-  - [x] Better (roughly level 7): hash chains with lazy matching, 4 MiB window
-  - [x] Best (roughly level 11): hash chains with lazy matching, 8 MiB window
+  - [x] Fastest (roughly level 1): one hash table, greedy matching, 512 KiB window
+  - [x] Default (roughly level 3): two hash tables (8-byte and 5-byte prefixes), greedy matching, 2 MiB window
+  - [x] Better: hash chains with lazy matching, 4 MiB window
+  - [x] Best: hash chains with lazy matching, 8 MiB window
+- [x] Repeat offset codes, searched by every level
+- [x] Huffman tables built from the literal frequencies, FSE tables for the sequences chosen per block
+  (predefined, RLE, repeated or new) by their estimated cost
 - [x] Checksums
 - [x] Dictionaries (raw content and the zstd dictionary format, the entropy tables of the latter are not used yet)
 
-The encoder does not yet make use of repeat offset codes and does not try to
-optimize the choice of entropy tables, so the ratio of the higher levels stays
-a bit behind the reference implementation and the speed is well behind it.
+Measured on GeoParquet pages (18,376 pages written by a GeoParquet writer for three hydraulic models) and
+512x512 float32 GeoTIFF tiles with the floating point predictor (a flood depth grid and a terrain model),
+each page or tile compressed as its own frame. Sizes against the reference implementation (libzstd 1.5.7
+through the `zstd` crate) on the same data; speeds single threaded on a shared machine, relative to the
+reference implementation measured in the same run:
 
-Measured on three inputs (the concatenated `decodecorpus_files`, the `*.rs` files of this
-repository and 48 MB of `*.rs` files from a cargo registry). Sizes are relative to the
-input, speeds are single threaded with the reference implementation measured through the
-`zstd` crate on the same machine:
+| Data                        | Fastest vs zstd -1 | speed vs zstd -1 | Default vs zstd -3 | speed vs zstd -3 |
+|-----------------------------|-------------------:|-----------------:|-------------------:|-----------------:|
+| GeoParquet, 29 MB, 6 kB pages   | -12.9 % | 0.56x | +0.4 % | 0.55x |
+| GeoParquet, 105 MB, 10 kB pages | -12.7 % | 0.53x | +0.4 % | 0.51x |
+| GeoParquet, 1 MB, 1.3 kB pages  | -3.8 %  | 0.54x | +2.2 % | 0.44x |
+| GeoParquet, 3.3 MB, 3.8 kB pages| -6.5 %  | 0.44x | +0.8 % | 0.41x |
+| GeoParquet, 185 MB, 119 kB pages| -4.0 %  | 0.49x | +0.6 % | 0.55x |
+| float32 tiles, depth, 27 MB     | -0.7 %  | 0.45x | +0.3 % | 0.54x |
+| float32 tiles, terrain, 104 MB  | +0.1 %  | 0.50x | +0.2 % | 0.49x |
+| **All**                         | **-4.5 %** |   | **+0.5 %** |      |
 
-| Level          | decodecorpus (11.5 MB) | ruzstd sources (0.5 MB) | registry sources (48 MB) |
-|----------------|------------------------|-------------------------|--------------------------|
-| Fastest        | 51.7 %, 54 MB/s        | 34.7 %, 67 MB/s         | 26.0 %, 74 MB/s          |
-| Default        | 42.6 %, 59 MB/s        | 21.4 %, 69 MB/s         | 13.6 %, 80 MB/s          |
-| Better         | 41.9 %, 30 MB/s        | 20.3 %, 30 MB/s         | 12.2 %, 35 MB/s          |
-| Best           | 41.6 %, 18 MB/s        | 20.2 %, 14 MB/s         | 12.0 %, 12 MB/s          |
-| zstd -1        | 46.4 %, 478 MB/s       | 24.1 %, 309 MB/s        | 16.2 %, 447 MB/s         |
-| zstd -3        | 43.4 %, 218 MB/s       | 22.3 %, 228 MB/s        | 14.5 %, 305 MB/s         |
-| zstd -7        | 41.8 %, 93 MB/s        | 19.7 %, 73 MB/s         | 12.0 %, 97 MB/s          |
-| zstd -11       | 41.6 %, 38 MB/s        | 19.2 %, 27 MB/s         | 11.1 %, 37 MB/s          |
+`Better` is 3.7 % smaller than zstd -3 on the same data at about a tenth of its speed, `Best` slower still.
 
-### Dictionaries
-
-Dictionaries help most for many small inputs that share structure. Measured on the 207 small
-systemd unit files in `dict_tests/files` (136 kB in total, 650 bytes on average) with the 52 kB
-dictionary in `dict_tests/dictionary`, reusing one `FrameCompressor` for all files:
-
-| Level          | without dictionary | with dictionary |
-|----------------|--------------------|-----------------|
-| Fastest        | 82.1 %, 31 MB/s    | 26.8 %, 30 MB/s |
-| Default        | 80.7 %, 30 MB/s    | 18.9 %, 25 MB/s |
-| Better         | 80.7 %, 19 MB/s    | 18.2 %, 16 MB/s |
-| Best           | 80.7 %, 23 MB/s    | 18.1 %, 19 MB/s |
-| zstd -1        | 63.2 %, 30 MB/s    | 19.9 %, 243 MB/s|
-| zstd -3        | 62.0 %, 17 MB/s    | 17.2 %, 227 MB/s|
-| zstd -7        | 61.7 %, 2 MB/s     | 15.0 %, 62 MB/s |
-
-The reference implementation shrinks its tables for small inputs when it knows the input size,
-which is where most of its speed advantage on tiny inputs comes from. Our compressor reads from a
-`Read` and does not know the size up front, but it only touches the parts of its tables a frame
-actually used, so reusing a compressor keeps the per-frame cost small. The convenience functions
-create a fresh compressor per call and are a lot slower for tiny inputs.
+The convenience functions create a new compressor per call. When the whole input fits into one block they
+know its size: the frame header then states it, and the matcher shrinks its window and tables to the input as
+the reference implementation does, so small inputs stay cheap. Reusing a `FrameCompressor` avoids the
+allocations as well.
 
 ## Dictionary Generation
 When the `dict_builder` feature is enabled, the `dictionary` module
@@ -146,7 +138,7 @@ Frames compressed with a dictionary in the zstd format carry its ID, so `FrameDe
 the decoding side. Raw content dictionaries have no ID, register one with
 `ruzstd::decoding::Dictionary::from_raw_content` and select it with `FrameDecoder::force_dict` after
 initializing the decoder for a frame. The specification only allows references into the dictionary while the
-frame holds at most `window_size` bytes, which is one block (128 kB) for `Fastest` and 2 MiB for `Default`.
+frame holds at most `window_size` bytes, which is 512 KiB for `Fastest` and 2 MiB for `Default`.
 
 ## Decompression
 
@@ -190,8 +182,7 @@ given block count has been decoded or the decodebuffer has reached a certain siz
     1. sequence_decoding and reverse_bitreader::get_bits. Those account for about 50% of the whole time used in decoding
     2. Matching suffixes. This accounts for >60% of the whole time used in encoding
 2. Implement encoder features
-    1. Repeat offset codes and smarter entropy table selection
-    2. Use the entropy tables of dictionaries
+    1. Use the entropy tables of dictionaries
 
 ## Testing
 

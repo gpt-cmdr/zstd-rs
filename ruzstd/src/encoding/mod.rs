@@ -80,6 +80,9 @@ pub fn compress_to_vec_with_dictionary<R: Read>(
 /// The compression mode used impacts the speed of compression,
 /// and resulting compression ratios. Faster compression will result
 /// in worse compression ratios, and vice versa.
+///
+/// If the whole input fits into one block (128 kB), the frame header states its size and the window and tables
+/// of the matcher are shrunk to fit it, so the memory usage given for each level is an upper bound.
 #[derive(Copy, Clone, Debug)]
 pub enum CompressionLevel {
     /// This level does not compress the data at all, and simply wraps
@@ -87,27 +90,21 @@ pub enum CompressionLevel {
     Uncompressed,
     /// This level is roughly equivalent to Zstd compression level 1.
     ///
-    /// Uses a greedy single-slot hash matcher with a window of one block (128 kB).
+    /// Uses one hash table of 6-byte prefixes and greedy matching (the reference implementation's `fast`
+    /// strategy) over a 512 KiB window. Memory usage of the matcher is about 1.3 MiB.
     Fastest,
     /// This level is roughly equivalent to Zstd level 3,
     /// or the one used by the official compressor when no level
     /// is specified.
     ///
-    /// Uses hash chains (depth 8) with a one-byte lazy match evaluation over a 2 MiB window.
-    /// Memory usage of the matcher is about 3.5 MiB.
+    /// Uses a hash table of 8-byte and one of 5-byte prefixes and greedy matching (the reference
+    /// implementation's `dfast` strategy) over a 2 MiB window. Memory usage of the matcher is about 3.3 MiB.
     Default,
-    /// This level is roughly equivalent to Zstd level 7.
-    ///
     /// Uses hash chains (depth 32) with a two-byte lazy match evaluation over a 4 MiB window.
     /// Memory usage of the matcher is about 7.5 MiB.
     Better,
-    /// This level is roughly equivalent to Zstd level 11.
-    ///
     /// Uses hash chains (depth 128) with a two-byte lazy match evaluation over a 8 MiB window.
     /// Memory usage of the matcher is about 14.5 MiB.
-    ///
-    /// Note that the encoder does not yet make use of repeat offset codes, so the compression ratio of
-    /// the higher levels stays somewhat behind the reference implementation.
     Best,
 }
 
