@@ -8,11 +8,12 @@ use twox_hash::XxHash64;
 #[cfg(feature = "hash")]
 use core::hash::Hasher;
 
+use super::blocks::CodedSequence;
 use super::{
     block_header::BlockHeader, frame_header::FrameHeader, levels::*,
     match_generator::MatchGeneratorDriver, CompressionLevel, Dictionary, Matcher,
 };
-use crate::fse::fse_encoder::{default_ll_table, default_ml_table, default_of_table, FSETable};
+use crate::fse::fse_encoder::FSETable;
 
 use crate::io::{Read, Write};
 
@@ -45,25 +46,43 @@ pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
     hasher: XxHash64,
 }
 
+/// The table the decoder uses for a field of the sequences if a block says "repeat the previous table"
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum PreviousTable {
+    /// There is none (start of the frame), or it is not worth repeating
+    None,
+    /// The predefined table of the format
+    Predefined,
+    Encoded(FSETable),
+}
+
 pub(crate) struct FseTables {
-    pub(crate) ll_default: FSETable,
-    pub(crate) ll_previous: Option<FSETable>,
-    pub(crate) ml_default: FSETable,
-    pub(crate) ml_previous: Option<FSETable>,
-    pub(crate) of_default: FSETable,
-    pub(crate) of_previous: Option<FSETable>,
+    /// The predefined tables, built when they are first used
+    pub(crate) ll_default: Option<FSETable>,
+    pub(crate) ll_previous: PreviousTable,
+    pub(crate) ml_default: Option<FSETable>,
+    pub(crate) ml_previous: PreviousTable,
+    pub(crate) of_default: Option<FSETable>,
+    pub(crate) of_previous: PreviousTable,
 }
 
 impl FseTables {
     pub fn new() -> Self {
         Self {
-            ll_default: default_ll_table(),
-            ll_previous: None,
-            ml_default: default_ml_table(),
-            ml_previous: None,
-            of_default: default_of_table(),
-            of_previous: None,
+            ll_default: None,
+            ll_previous: PreviousTable::None,
+            ml_default: None,
+            ml_previous: PreviousTable::None,
+            of_default: None,
+            of_previous: PreviousTable::None,
         }
+    }
+
+    /// Forget the previous tables, a new frame can not repeat them
+    pub(crate) fn reset(&mut self) {
+        self.ll_previous = PreviousTable::None;
+        self.ml_previous = PreviousTable::None;
+        self.of_previous = PreviousTable::None;
     }
 }
 
@@ -76,6 +95,9 @@ pub(crate) struct CompressState<M: Matcher> {
     pub(crate) fse_tables: FseTables,
     /// The three most recent offsets as the decoder sees them, used to encode repeated offsets as repeat codes
     pub(crate) offset_history: [u32; 3],
+    /// Buffers for the literals and sequences of a block, kept to avoid allocating them for every block
+    pub(crate) literals_buf: Vec<u8>,
+    pub(crate) sequences_buf: Vec<CodedSequence>,
 }
 
 impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
@@ -91,6 +113,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
                 offset_history: INITIAL_OFFSET_HISTORY,
+                literals_buf: Vec::new(),
+                sequences_buf: Vec::new(),
             },
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
@@ -109,6 +133,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
                 offset_history: INITIAL_OFFSET_HISTORY,
+                literals_buf: Vec::new(),
+                sequences_buf: Vec::new(),
             },
             compression_level,
             dictionary: None,
@@ -145,6 +171,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             self.state.matcher.load_dictionary(dict.content());
         }
         self.state.last_huff_table = None;
+        self.state.fse_tables.reset();
         // The decoder starts the frame with the repeat offsets of the dictionary, if there is one
         self.state.offset_history = self
             .dictionary

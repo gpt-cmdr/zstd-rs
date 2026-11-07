@@ -2,48 +2,116 @@ use alloc::vec::Vec;
 
 use crate::{
     bit_io::BitWriter,
-    encoding::frame_compressor::CompressState,
+    encoding::frame_compressor::{CompressState, PreviousTable},
     encoding::{Matcher, Sequence},
-    fse::fse_encoder::{build_table_from_data, FSETable, State},
+    fse::fse_encoder::{self, FSETable, State},
     huff0::huff0_encoder,
 };
 
+/// What the decoder will know after a compressed block: the offset history and the entropy tables later blocks
+/// may repeat. The caller applies it only if the block is actually emitted as a compressed block, a raw block
+/// does not show any of it to the decoder.
+#[must_use]
+pub struct BlockEntropy {
+    offset_history: [u32; 3],
+    huff_table: Option<huff0_encoder::HuffmanTable>,
+    ll: Option<PreviousTable>,
+    ml: Option<PreviousTable>,
+    of: Option<PreviousTable>,
+}
+
+impl BlockEntropy {
+    /// Make this block's state the one later blocks build on
+    pub(crate) fn commit<M: Matcher>(self, state: &mut CompressState<M>) {
+        state.offset_history = self.offset_history;
+        if let Some(table) = self.huff_table {
+            state.last_huff_table = Some(table);
+        }
+        if let Some(t) = self.ll {
+            state.fse_tables.ll_previous = t;
+        }
+        if let Some(t) = self.ml {
+            state.fse_tables.ml_previous = t;
+        }
+        if let Some(t) = self.of {
+            state.fse_tables.of_previous = t;
+        }
+    }
+}
+
+/// A sequence with its symbols already computed
+#[derive(Clone, Copy)]
+pub(crate) struct CodedSequence {
+    ll: u32,
+    ml: u32,
+    of: u32,
+    ll_code: u8,
+    ml_code: u8,
+    of_code: u8,
+}
+
 /// A block of [`crate::common::BlockType::Compressed`]
 ///
-/// Returns the offset history after this block. The caller must store it in `state.offset_history` only if this
-/// block is actually emitted: if it is replaced by a raw block the decoder does not see these sequences.
-#[must_use]
-pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec<u8>) -> [u32; 3] {
-    let mut literals_vec = Vec::new();
-    let mut sequences = Vec::new();
-    let mut offset_history = state.offset_history;
-    state.matcher.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => literals_vec.extend_from_slice(literals),
+/// Returns the state the decoder has after this block, see [`BlockEntropy`].
+pub fn compress_block<M: Matcher>(
+    state: &mut CompressState<M>,
+    output: &mut Vec<u8>,
+) -> BlockEntropy {
+    let CompressState {
+        matcher,
+        literals_buf,
+        sequences_buf,
+        offset_history,
+        ..
+    } = state;
+    let mut offset_history = *offset_history;
+    literals_buf.clear();
+    sequences_buf.clear();
+    let mut counts = SymbolCounts::new();
+    matcher.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => literals_buf.extend_from_slice(literals),
         Sequence::Triple {
             literals,
             offset,
             match_len,
         } => {
-            literals_vec.extend_from_slice(literals);
-            sequences.push(crate::blocks::sequence_section::Sequence {
-                ll: literals.len() as u32,
-                ml: match_len as u32,
-                of: encode_offset_value(offset as u32, literals.len() as u32, &mut offset_history),
-            });
+            literals_buf.extend_from_slice(literals);
+            let ll = literals.len() as u32;
+            let ml = match_len as u32;
+            let of = encode_offset_value(offset as u32, ll, &mut offset_history);
+            let seq = CodedSequence {
+                ll,
+                ml,
+                of,
+                ll_code: ll_code(ll),
+                ml_code: ml_code(ml),
+                of_code: of.ilog2() as u8,
+            };
+            counts.ll[seq.ll_code as usize] += 1;
+            counts.ml[seq.ml_code as usize] += 1;
+            counts.of[seq.of_code as usize] += 1;
+            sequences_buf.push(seq);
         }
     });
+    let literals_vec = &state.literals_buf;
+    let sequences = &state.sequences_buf;
+
+    let mut entropy = BlockEntropy {
+        offset_history,
+        huff_table: None,
+        ll: None,
+        ml: None,
+        of: None,
+    };
 
     // literals section
 
     let mut writer = BitWriter::from(output);
     if literals_vec.len() > 1024 {
-        if let Some(table) =
-            compress_literals(&literals_vec, state.last_huff_table.as_ref(), &mut writer)
-        {
-            state.last_huff_table.replace(table);
-        }
+        entropy.huff_table =
+            compress_literals(literals_vec, state.last_huff_table.as_ref(), &mut writer);
     } else {
-        raw_literals(&literals_vec, &mut writer);
+        raw_literals(literals_vec, &mut writer);
     }
 
     // sequences section
@@ -53,25 +121,27 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
     } else {
         encode_seqnum(sequences.len(), &mut writer);
 
-        // Choose the tables
-        // TODO store previously used tables
+        let tables = &mut state.fse_tables;
         let ll_mode = choose_table(
-            state.fse_tables.ll_previous.as_ref(),
-            &state.fse_tables.ll_default,
-            sequences.iter().map(|seq| encode_literal_length(seq.ll).0),
-            9,
+            &tables.ll_previous,
+            &counts.ll,
+            LL_MAX_LOG,
+            fse_encoder::LL_DIST,
+            6,
         );
         let ml_mode = choose_table(
-            state.fse_tables.ml_previous.as_ref(),
-            &state.fse_tables.ml_default,
-            sequences.iter().map(|seq| encode_match_len(seq.ml).0),
-            9,
+            &tables.ml_previous,
+            &counts.ml,
+            ML_MAX_LOG,
+            fse_encoder::ML_DIST,
+            6,
         );
         let of_mode = choose_table(
-            state.fse_tables.of_previous.as_ref(),
-            &state.fse_tables.of_default,
-            sequences.iter().map(|seq| encode_offset(seq.of).0),
-            8,
+            &tables.of_previous,
+            &counts.of,
+            OF_MAX_LOG,
+            fse_encoder::OF_DIST,
+            5,
         );
 
         writer.write_bits(encode_fse_table_modes(&ll_mode, &ml_mode, &of_mode), 8);
@@ -80,26 +150,53 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
         encode_table(&of_mode, &mut writer);
         encode_table(&ml_mode, &mut writer);
 
-        encode_sequences(
-            &sequences,
-            &mut writer,
-            ll_mode.as_ref(),
-            ml_mode.as_ref(),
-            of_mode.as_ref(),
+        let ll_table = resolve(
+            &ll_mode,
+            &tables.ll_previous,
+            &mut tables.ll_default,
+            fse_encoder::default_ll_table,
         );
+        let ml_table = resolve(
+            &ml_mode,
+            &tables.ml_previous,
+            &mut tables.ml_default,
+            fse_encoder::default_ml_table,
+        );
+        let of_table = resolve(
+            &of_mode,
+            &tables.of_previous,
+            &mut tables.of_default,
+            fse_encoder::default_of_table,
+        );
+        encode_sequences(sequences, &mut writer, ll_table, ml_table, of_table);
 
-        if let FseTableMode::Encoded(table) = ll_mode {
-            state.fse_tables.ll_previous = Some(table)
-        }
-        if let FseTableMode::Encoded(table) = ml_mode {
-            state.fse_tables.ml_previous = Some(table)
-        }
-        if let FseTableMode::Encoded(table) = of_mode {
-            state.fse_tables.of_previous = Some(table)
-        }
+        entropy.ll = ll_mode.into_previous();
+        entropy.ml = ml_mode.into_previous();
+        entropy.of = of_mode.into_previous();
     }
     writer.flush();
-    offset_history
+    entropy
+}
+
+/// Largest accuracy logs the format allows for the three fields (RFC 8878, section 3.1.1.3.2.2)
+const LL_MAX_LOG: u8 = 9;
+const ML_MAX_LOG: u8 = 9;
+const OF_MAX_LOG: u8 = 8;
+
+struct SymbolCounts {
+    ll: [u32; 36],
+    ml: [u32; 53],
+    of: [u32; 32],
+}
+
+impl SymbolCounts {
+    fn new() -> Self {
+        Self {
+            ll: [0; 36],
+            ml: [0; 53],
+            of: [0; 32],
+        }
+    }
 }
 
 /// Turns an actual match offset into the offset value written to the stream, using a repeat code when the offset is
@@ -140,125 +237,269 @@ pub(crate) fn encode_offset_value(offset: u32, literal_len: u32, history: &mut [
     offset + 3
 }
 
-#[derive(Clone)]
+/// How the symbols of one field of the sequences are encoded in a block
 #[allow(clippy::large_enum_variant)]
-enum FseTableMode<'a> {
-    Predefined(&'a FSETable),
+enum FseTableMode {
+    Predefined,
+    /// Every sequence has this symbol
+    Rle(u8),
     Encoded(FSETable),
-    RepeateLast(&'a FSETable),
+    RepeatLast,
 }
 
-impl FseTableMode<'_> {
-    pub fn as_ref(&self) -> &FSETable {
+impl FseTableMode {
+    /// The table later blocks may repeat after this block, `None` if it stays what it was
+    fn into_previous(self) -> Option<PreviousTable> {
         match self {
-            Self::Predefined(t) => t,
-            Self::RepeateLast(t) => t,
-            Self::Encoded(t) => t,
+            Self::Predefined => Some(PreviousTable::Predefined),
+            // Repeating an RLE "table" is valid, but never chosen
+            Self::Rle(_) => Some(PreviousTable::None),
+            Self::Encoded(table) => Some(PreviousTable::Encoded(table)),
+            Self::RepeatLast => None,
         }
     }
 }
 
-fn choose_table<'a>(
-    previous: Option<&'a FSETable>,
-    default_table: &'a FSETable,
-    data: impl Iterator<Item = u8>,
-    max_log: u8,
-) -> FseTableMode<'a> {
-    // TODO check if the new table is better than the predefined and previous table
-    let use_new_table = true;
-    let use_previous_table = false;
-    if use_previous_table {
-        FseTableMode::RepeateLast(previous.unwrap())
-    } else if use_new_table {
-        FseTableMode::Encoded(build_table_from_data(data, max_log, true))
-    } else {
-        FseTableMode::Predefined(default_table)
+/// The table to encode with, `None` for RLE
+fn resolve<'a>(
+    mode: &'a FseTableMode,
+    previous: &'a PreviousTable,
+    default: &'a mut Option<FSETable>,
+    make_default: fn() -> FSETable,
+) -> Option<&'a FSETable> {
+    match mode {
+        FseTableMode::Rle(_) => None,
+        FseTableMode::Encoded(table) => Some(table),
+        FseTableMode::Predefined => Some(default.get_or_insert_with(make_default)),
+        FseTableMode::RepeatLast => match previous {
+            PreviousTable::Encoded(table) => Some(table),
+            PreviousTable::Predefined => Some(default.get_or_insert_with(make_default)),
+            PreviousTable::None => unreachable!("repeat without a previous table"),
+        },
     }
 }
 
-fn encode_table(mode: &FseTableMode<'_>, writer: &mut BitWriter<&mut Vec<u8>>) {
+/// Pick the cheapest of the predefined table, an RLE symbol, the previous block's table and a new table, by the
+/// estimated number of bits of the table description plus the encoded symbols
+fn choose_table(
+    previous: &PreviousTable,
+    counts: &[u32],
+    max_log: u8,
+    default_probs: &[i16],
+    default_log: u8,
+) -> FseTableMode {
+    let mut used = 0;
+    let mut last_used = 0;
+    for (symbol, &count) in counts.iter().enumerate() {
+        if count > 0 {
+            used += 1;
+            last_used = symbol;
+        }
+    }
+    let predefined = fse_encoder::cost_with_probs(default_probs, default_log, counts);
+    let repeat = match previous {
+        PreviousTable::None => None,
+        PreviousTable::Predefined => predefined,
+        PreviousTable::Encoded(table) => table.cost(counts),
+    };
+    let mut best = FseTableMode::Predefined;
+    let mut best_cost = predefined.unwrap_or(u64::MAX);
+    if let Some(cost) = repeat {
+        if cost < best_cost {
+            best = FseTableMode::RepeatLast;
+            best_cost = cost;
+        }
+    }
+    if used == 1 {
+        // One byte for the symbol, nothing per sequence
+        if 8 * 256 < best_cost {
+            best = FseTableMode::Rle(last_used as u8);
+        }
+        return best;
+    }
+    let (probs, table_log) = fse_encoder::normalize(&counts[..=last_used], max_log);
+    let new_cost = (fse_encoder::description_bits(&probs, table_log) as u64) * 256
+        + fse_encoder::cost_with_probs(&probs, table_log, counts).unwrap();
+    if new_cost < best_cost {
+        best = FseTableMode::Encoded(fse_encoder::build_table_from_probabilities(
+            &probs, table_log,
+        ));
+    }
+    best
+}
+
+fn encode_table(mode: &FseTableMode, writer: &mut BitWriter<&mut Vec<u8>>) {
     match mode {
-        FseTableMode::Predefined(_) => {}
-        FseTableMode::RepeateLast(_) => {}
+        FseTableMode::Predefined => {}
+        FseTableMode::RepeatLast => {}
+        FseTableMode::Rle(symbol) => writer.write_bits(*symbol, 8),
         FseTableMode::Encoded(table) => table.write_table(writer),
     }
 }
 
 fn encode_fse_table_modes(
-    ll_mode: &FseTableMode<'_>,
-    ml_mode: &FseTableMode<'_>,
-    of_mode: &FseTableMode<'_>,
+    ll_mode: &FseTableMode,
+    ml_mode: &FseTableMode,
+    of_mode: &FseTableMode,
 ) -> u8 {
-    fn mode_to_bits(mode: &FseTableMode<'_>) -> u8 {
+    fn mode_to_bits(mode: &FseTableMode) -> u8 {
         match mode {
-            FseTableMode::Predefined(_) => 0,
+            FseTableMode::Predefined => 0,
+            FseTableMode::Rle(_) => 1,
             FseTableMode::Encoded(_) => 2,
-            FseTableMode::RepeateLast(_) => 3,
+            FseTableMode::RepeatLast => 3,
         }
     }
     mode_to_bits(ll_mode) << 6 | mode_to_bits(of_mode) << 4 | mode_to_bits(ml_mode) << 2
 }
 
 fn encode_sequences(
-    sequences: &[crate::blocks::sequence_section::Sequence],
+    sequences: &[CodedSequence],
     writer: &mut BitWriter<&mut Vec<u8>>,
-    ll_table: &FSETable,
-    ml_table: &FSETable,
-    of_table: &FSETable,
+    ll_table: Option<&FSETable>,
+    ml_table: Option<&FSETable>,
+    of_table: Option<&FSETable>,
 ) {
-    let sequence = sequences[sequences.len() - 1];
-    let (ll_code, ll_add_bits, ll_num_bits) = encode_literal_length(sequence.ll);
-    let (of_code, of_add_bits, of_num_bits) = encode_offset(sequence.of);
-    let (ml_code, ml_add_bits, ml_num_bits) = encode_match_len(sequence.ml);
-    let mut ll_state: &State = ll_table.start_state(ll_code);
-    let mut ml_state: &State = ml_table.start_state(ml_code);
-    let mut of_state: &State = of_table.start_state(of_code);
+    // RLE fields have no state and write no bits. Dispatch once, so the loop is specialized for each case.
+    match (ll_table, ml_table, of_table) {
+        (Some(ll), Some(ml), Some(of)) => {
+            encode_sequences_with(sequences, writer, Some(ll), Some(ml), Some(of))
+        }
+        (ll, ml, of) => encode_sequences_with(sequences, writer, ll, ml, of),
+    }
+}
 
-    writer.write_bits(ll_add_bits, ll_num_bits);
-    writer.write_bits(ml_add_bits, ml_num_bits);
-    writer.write_bits(of_add_bits, of_num_bits);
+#[inline(always)]
+fn encode_sequences_with(
+    sequences: &[CodedSequence],
+    writer: &mut BitWriter<&mut Vec<u8>>,
+    ll_table: Option<&FSETable>,
+    ml_table: Option<&FSETable>,
+    of_table: Option<&FSETable>,
+) {
+    let init = |table: Option<&FSETable>, symbol| table.map(|t| t.init_state(symbol));
+    let last = sequences[sequences.len() - 1];
+    let mut ll_state = init(ll_table, last.ll_code);
+    let mut ml_state = init(ml_table, last.ml_code);
+    let mut of_state = init(of_table, last.of_code);
+    write_extra_bits(&last, writer);
 
     // encode backwards so the decoder reads the first sequence first
-    if sequences.len() > 1 {
-        for sequence in (0..=sequences.len() - 2).rev() {
-            let sequence = sequences[sequence];
-            let (ll_code, ll_add_bits, ll_num_bits) = encode_literal_length(sequence.ll);
-            let (of_code, of_add_bits, of_num_bits) = encode_offset(sequence.of);
-            let (ml_code, ml_add_bits, ml_num_bits) = encode_match_len(sequence.ml);
-
-            {
-                let next = of_table.next_state(of_code, of_state.index);
-                let diff = of_state.index - next.baseline;
-                writer.write_bits(diff as u64, next.num_bits as usize);
-                of_state = next;
-            }
-            {
-                let next = ml_table.next_state(ml_code, ml_state.index);
-                let diff = ml_state.index - next.baseline;
-                writer.write_bits(diff as u64, next.num_bits as usize);
-                ml_state = next;
-            }
-            {
-                let next = ll_table.next_state(ll_code, ll_state.index);
-                let diff = ll_state.index - next.baseline;
-                writer.write_bits(diff as u64, next.num_bits as usize);
-                ll_state = next;
-            }
-
-            writer.write_bits(ll_add_bits, ll_num_bits);
-            writer.write_bits(ml_add_bits, ml_num_bits);
-            writer.write_bits(of_add_bits, of_num_bits);
+    for seq in sequences[..sequences.len() - 1].iter().rev() {
+        if let (Some(t), Some(s)) = (of_table, of_state.as_mut()) {
+            t.encode(s, seq.of_code, writer);
         }
+        if let (Some(t), Some(s)) = (ml_table, ml_state.as_mut()) {
+            t.encode(s, seq.ml_code, writer);
+        }
+        if let (Some(t), Some(s)) = (ll_table, ll_state.as_mut()) {
+            t.encode(s, seq.ll_code, writer);
+        }
+        write_extra_bits(seq, writer);
     }
-    writer.write_bits(ml_state.index as u64, ml_table.table_size.ilog2() as usize);
-    writer.write_bits(of_state.index as u64, of_table.table_size.ilog2() as usize);
-    writer.write_bits(ll_state.index as u64, ll_table.table_size.ilog2() as usize);
+    let flush = |table: Option<&FSETable>, state: &Option<State>, writer: &mut BitWriter<_>| {
+        if let (Some(t), Some(s)) = (table, state) {
+            t.flush_state(s, writer);
+        }
+    };
+    flush(ml_table, &ml_state, writer);
+    flush(of_table, &of_state, writer);
+    flush(ll_table, &ll_state, writer);
 
     let bits_to_fill = writer.misaligned();
     if bits_to_fill == 0 {
         writer.write_bits(1u32, 8);
     } else {
         writer.write_bits(1u32, bits_to_fill);
+    }
+}
+
+#[inline(always)]
+fn write_extra_bits(seq: &CodedSequence, writer: &mut BitWriter<&mut Vec<u8>>) {
+    let ll_bits = LL_BITS[seq.ll_code as usize];
+    let ml_bits = ML_BITS[seq.ml_code as usize];
+    let of_bits = seq.of_code;
+    writer.write_bits_64(
+        u64::from(seq.ll - LL_BASE[seq.ll_code as usize]),
+        ll_bits as usize,
+    );
+    writer.write_bits_64(
+        u64::from(seq.ml - ML_BASE[seq.ml_code as usize]),
+        ml_bits as usize,
+    );
+    writer.write_bits_64(u64::from(seq.of & ((1 << of_bits) - 1)), of_bits as usize);
+}
+
+/// Number of extra bits of each literal length code (RFC 8878, section 3.1.1.3.2.1.1)
+const LL_BITS: [u8; 36] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11,
+    12, 13, 14, 15, 16,
+];
+/// Smallest literal length of each code
+const LL_BASE: [u32; 36] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48, 64,
+    128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
+];
+/// Number of extra bits of each match length code
+const ML_BITS: [u8; 53] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+];
+/// Smallest match length of each code
+const ML_BASE: [u32; 53] = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+    28, 29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027,
+    2051, 4099, 8195, 16387, 32771, 65539,
+];
+
+/// The literal length code of each length below 64
+const LL_CODE: [u8; 64] = {
+    let mut table = [0u8; 64];
+    let mut code = 0;
+    let mut len = 0;
+    while len < 64 {
+        while code + 1 < LL_BASE.len() && LL_BASE[code + 1] <= len as u32 {
+            code += 1;
+        }
+        table[len] = code as u8;
+        len += 1;
+    }
+    table
+};
+
+/// The match length code of each `match_len - 3` below 128
+const ML_CODE: [u8; 128] = {
+    let mut table = [0u8; 128];
+    let mut code = 0;
+    let mut len = 0;
+    while len < 128 {
+        while code + 1 < ML_BASE.len() && ML_BASE[code + 1] <= len as u32 + 3 {
+            code += 1;
+        }
+        table[len] = code as u8;
+        len += 1;
+    }
+    table
+};
+
+#[inline(always)]
+fn ll_code(len: u32) -> u8 {
+    if len < 64 {
+        LL_CODE[len as usize]
+    } else {
+        // From 64 on every code covers a power of two
+        len.ilog2() as u8 + 19
+    }
+}
+
+#[inline(always)]
+fn ml_code(len: u32) -> u8 {
+    debug_assert!(len >= 3);
+    let base = len - 3;
+    if base < 128 {
+        ML_CODE[base as usize]
+    } else {
+        base.ilog2() as u8 + 36
     }
 }
 
@@ -282,68 +523,6 @@ fn encode_seqnum(seqnum: usize, writer: &mut BitWriter<impl AsMut<Vec<u8>>>) {
         }
         _ => unreachable!(),
     }
-}
-
-fn encode_literal_length(len: u32) -> (u8, u32, usize) {
-    match len {
-        0..=15 => (len as u8, 0, 0),
-        16..=17 => (16, len - 16, 1),
-        18..=19 => (17, len - 18, 1),
-        20..=21 => (18, len - 20, 1),
-        22..=23 => (19, len - 22, 1),
-        24..=27 => (20, len - 24, 2),
-        28..=31 => (21, len - 28, 2),
-        32..=39 => (22, len - 32, 3),
-        40..=47 => (23, len - 40, 3),
-        48..=63 => (24, len - 48, 4),
-        64..=127 => (25, len - 64, 6),
-        128..=255 => (26, len - 128, 7),
-        256..=511 => (27, len - 256, 8),
-        512..=1023 => (28, len - 512, 9),
-        1024..=2047 => (29, len - 1024, 10),
-        2048..=4095 => (30, len - 2048, 11),
-        4096..=8191 => (31, len - 4096, 12),
-        8192..=16383 => (32, len - 8192, 13),
-        16384..=32767 => (33, len - 16384, 14),
-        32768..=65535 => (34, len - 32768, 15),
-        65536..=131071 => (35, len - 65536, 16),
-        131072.. => unreachable!(),
-    }
-}
-
-fn encode_match_len(len: u32) -> (u8, u32, usize) {
-    match len {
-        0..=2 => unreachable!(),
-        3..=34 => (len as u8 - 3, 0, 0),
-        35..=36 => (32, len - 35, 1),
-        37..=38 => (33, len - 37, 1),
-        39..=40 => (34, len - 39, 1),
-        41..=42 => (35, len - 41, 1),
-        43..=46 => (36, len - 43, 2),
-        47..=50 => (37, len - 47, 2),
-        51..=58 => (38, len - 51, 3),
-        59..=66 => (39, len - 59, 3),
-        67..=82 => (40, len - 67, 4),
-        83..=98 => (41, len - 83, 4),
-        99..=130 => (42, len - 99, 5),
-        131..=258 => (43, len - 131, 7),
-        259..=514 => (44, len - 259, 8),
-        515..=1026 => (45, len - 515, 9),
-        1027..=2050 => (46, len - 1027, 10),
-        2051..=4098 => (47, len - 2051, 11),
-        4099..=8194 => (48, len - 4099, 12),
-        8195..=16386 => (49, len - 8195, 13),
-        16387..=32770 => (50, len - 16387, 14),
-        32771..=65538 => (51, len - 32771, 15),
-        65539..=131074 => (52, len - 65539, 16),
-        131075.. => unreachable!(),
-    }
-}
-
-fn encode_offset(len: u32) -> (u8, u32, usize) {
-    let log = len.ilog2();
-    let lower = len & ((1 << log) - 1);
-    (log as u8, lower, log as usize)
 }
 
 fn raw_literals(literals: &[u8], writer: &mut BitWriter<&mut Vec<u8>>) {
