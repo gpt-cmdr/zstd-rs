@@ -209,16 +209,29 @@ impl Tables {
 
     #[inline(always)]
     fn set_hash(&mut self, slot: usize, value: u32) {
-        self.hash[slot] = value;
-        if self.tracking {
-            self.touch(slot, true);
-        }
+        self.set_hash_t::<true>(slot, value)
     }
 
     #[inline(always)]
     fn set_chain(&mut self, slot: usize, value: u32) {
+        self.set_chain_t::<true>(slot, value)
+    }
+
+    /// Set a slot of the hash table. With `TRACK == false` the slot is not recorded, which is only correct while
+    /// `tracking` is off.
+    #[inline(always)]
+    fn set_hash_t<const TRACK: bool>(&mut self, slot: usize, value: u32) {
+        self.hash[slot] = value;
+        if TRACK && self.tracking {
+            self.touch(slot, true);
+        }
+    }
+
+    /// See `set_hash_t`
+    #[inline(always)]
+    fn set_chain_t<const TRACK: bool>(&mut self, slot: usize, value: u32) {
         self.chain[slot] = value;
-        if self.tracking {
+        if TRACK && self.tracking {
             self.touch(slot, false);
         }
     }
@@ -375,6 +388,11 @@ impl WindowMatcher {
         self.tables.resize(&self.params);
         self.capacity =
             self.params.window_size() + dict_len + SLACK_BLOCKS * MAX_BLOCK_SIZE as usize;
+        if self.size_hint.is_none() {
+            // Growing the buffer block by block would copy the data again at every doubling. Reserving the whole
+            // buffer only costs address space, the pages are used as the data arrives.
+            self.buf.reserve(self.capacity);
+        }
     }
 
     /// Place dictionary content in front of the data of the next frame. Must be called right after `reset` (and
@@ -537,14 +555,21 @@ impl WindowMatcher {
 
     pub(crate) fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         match self.params.strategy {
-            Strategy::Fast => self.match_greedy::<false>(handle_sequence),
-            Strategy::DoubleFast => self.match_greedy::<true>(handle_sequence),
+            // Recording the written slots is only needed in frames with a dictionary
+            Strategy::Fast if self.tables.tracking => {
+                self.match_greedy::<false, true>(handle_sequence)
+            }
+            Strategy::Fast => self.match_greedy::<false, false>(handle_sequence),
+            Strategy::DoubleFast if self.tables.tracking => {
+                self.match_greedy::<true, true>(handle_sequence)
+            }
+            Strategy::DoubleFast => self.match_greedy::<true, false>(handle_sequence),
             Strategy::Lazy => self.match_lazy(handle_sequence),
         }
     }
 
     /// The greedy strategies: [`Strategy::Fast`] (`DOUBLE == false`) and [`Strategy::DoubleFast`]
-    fn match_greedy<const DOUBLE: bool>(
+    fn match_greedy<const DOUBLE: bool, const TRACK: bool>(
         &mut self,
         mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
     ) {
@@ -602,12 +627,12 @@ impl WindowMatcher {
                 let h_l = hash8(v, long_log);
                 let cand_long = tables.hash[h_l];
                 let cand_short = tables.chain[h_s];
-                tables.set_hash(h_l, cur);
-                tables.set_chain(h_s, cur);
+                tables.set_hash_t::<TRACK>(h_l, cur);
+                tables.set_chain_t::<TRACK>(h_s, cur);
                 (cand_long, cand_short)
             } else {
                 let cand = tables.hash[h_s];
-                tables.set_hash(h_s, cur);
+                tables.set_hash_t::<TRACK>(h_s, cur);
                 (0, cand)
             };
 
@@ -646,7 +671,7 @@ impl WindowMatcher {
                             let v1 = read_u64(buf, ip + 1);
                             let h_l1 = hash8(v1, long_log);
                             let cand = tables.hash[h_l1];
-                            tables.set_hash(h_l1, cur + 1);
+                            tables.set_hash_t::<TRACK>(h_l1, cur + 1);
                             let m1 = (cand.wrapping_sub(base)) as usize;
                             if cand >= low_abs && read_u64(buf, m1) == v1 {
                                 Some((
@@ -692,16 +717,22 @@ impl WindowMatcher {
                 let fill = searched + 2;
                 if DOUBLE {
                     let v = read_u64(buf, fill);
-                    tables.set_hash(hash8(v, long_log), fill as u32 + base);
-                    tables.set_chain(short.hash(v), fill as u32 + base);
-                    tables.set_hash(
+                    tables.set_hash_t::<TRACK>(hash8(v, long_log), fill as u32 + base);
+                    tables.set_chain_t::<TRACK>(short.hash(v), fill as u32 + base);
+                    tables.set_hash_t::<TRACK>(
                         hash8(read_u64(buf, ip - 2), long_log),
                         (ip - 2) as u32 + base,
                     );
-                    tables.set_chain(short.hash(read_u64(buf, ip - 1)), (ip - 1) as u32 + base);
+                    tables.set_chain_t::<TRACK>(
+                        short.hash(read_u64(buf, ip - 1)),
+                        (ip - 1) as u32 + base,
+                    );
                 } else {
-                    tables.set_hash(short.hash(read_u64(buf, fill)), fill as u32 + base);
-                    tables.set_hash(short.hash(read_u64(buf, ip - 2)), (ip - 2) as u32 + base);
+                    tables.set_hash_t::<TRACK>(short.hash(read_u64(buf, fill)), fill as u32 + base);
+                    tables.set_hash_t::<TRACK>(
+                        short.hash(read_u64(buf, ip - 2)),
+                        (ip - 2) as u32 + base,
+                    );
                 }
 
                 // An immediate match at the second most recent offset, which is cheap to encode without literals
@@ -713,10 +744,10 @@ impl WindowMatcher {
                     let len = 4 + common_prefix_len(buf, ip - r2 + 4, ip + 4, block_end);
                     let v = read_u64(buf, ip);
                     if DOUBLE {
-                        tables.set_hash(hash8(v, long_log), ip as u32 + base);
-                        tables.set_chain(short.hash(v), ip as u32 + base);
+                        tables.set_hash_t::<TRACK>(hash8(v, long_log), ip as u32 + base);
+                        tables.set_chain_t::<TRACK>(short.hash(v), ip as u32 + base);
                     } else {
-                        tables.set_hash(short.hash(v), ip as u32 + base);
+                        tables.set_hash_t::<TRACK>(short.hash(v), ip as u32 + base);
                     }
                     encode_offset_value(r2 as u32, 0, &mut rep);
                     handle_sequence(Sequence::Triple {

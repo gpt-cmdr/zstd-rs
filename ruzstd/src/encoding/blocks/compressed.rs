@@ -67,6 +67,10 @@ pub fn compress_block<M: Matcher>(
     let mut offset_history = *offset_history;
     literals_buf.clear();
     sequences_buf.clear();
+    // Enough for most blocks, so the buffers do not grow in small steps while matching
+    let block_len = matcher.get_last_space().len();
+    literals_buf.reserve(block_len);
+    sequences_buf.reserve(block_len / 16);
     let mut counts = SymbolCounts::new();
     matcher.start_matching(|seq| match seq {
         Sequence::Literals { literals } => literals_buf.extend_from_slice(literals),
@@ -75,7 +79,7 @@ pub fn compress_block<M: Matcher>(
             offset,
             match_len,
         } => {
-            literals_buf.extend_from_slice(literals);
+            push_literals(literals_buf, literals);
             let ll = literals.len() as u32;
             let ml = match_len as u32;
             let of = encode_offset_value(offset as u32, ll, &mut offset_history);
@@ -176,6 +180,19 @@ pub fn compress_block<M: Matcher>(
     }
     writer.flush();
     entropy
+}
+
+/// Append the literals of a sequence. Most runs are a few bytes long, for which a call to `memcpy` costs more than
+/// the copy.
+#[inline(always)]
+fn push_literals(buf: &mut Vec<u8>, literals: &[u8]) {
+    if literals.len() <= 16 {
+        for &b in literals {
+            buf.push(b);
+        }
+    } else {
+        buf.extend_from_slice(literals);
+    }
 }
 
 /// Largest accuracy logs the format allows for the three fields (RFC 8878, section 3.1.1.3.2.2)
