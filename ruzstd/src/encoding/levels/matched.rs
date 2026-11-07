@@ -44,15 +44,17 @@ pub fn compress_matched_block<M: Matcher>(
         header.serialize(output);
         output.push(rle_byte);
     } else {
-        // Compress as a standard compressed block
-        let mut compressed = Vec::new();
+        // Compress as a standard compressed block, right behind a placeholder for its header
         state.matcher.commit_space(uncompressed_data);
-        let entropy = compress_block(state, &mut compressed);
-        let compressed_size = compressed.len();
+        let header_at = output.len();
+        output.extend_from_slice(&[0; 3]);
+        let entropy = compress_block(state, output);
+        let compressed_size = output.len() - header_at - 3;
         // If compression does not shrink the block, store it raw instead.
         // Also preserve the format guard that compressed blocks must not
         // exceed the maximum block size.
         if compressed_size >= block_size as usize || compressed_size > MAX_BLOCK_SIZE as usize {
+            output.truncate(header_at);
             let header = BlockHeader {
                 last_block,
                 block_type: crate::blocks::block::BlockType::Raw,
@@ -69,9 +71,9 @@ pub fn compress_matched_block<M: Matcher>(
                 block_type: crate::blocks::block::BlockType::Compressed,
                 block_size: compressed_size as u32,
             };
-            // Write the header, then the block
-            header.serialize(output);
-            output.extend(compressed);
+            let mut encoded = Vec::with_capacity(3);
+            header.serialize(&mut encoded);
+            output[header_at..header_at + 3].copy_from_slice(&encoded);
         }
     }
 }

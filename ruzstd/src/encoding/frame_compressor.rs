@@ -167,9 +167,6 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     pub fn compress(&mut self) {
         // Clearing buffers to allow re-using of the compressor
         self.state.matcher.reset(self.compression_level);
-        if let Some(dict) = &self.dictionary {
-            self.state.matcher.load_dictionary(dict.content());
-        }
         self.state.last_huff_table = None;
         self.state.fse_tables.reset();
         // The decoder starts the frame with the repeat offsets of the dictionary, if there is one
@@ -183,12 +180,26 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         }
         let source = self.uncompressed_data.as_mut().unwrap();
         let drain = self.compressed_data.as_mut().unwrap();
+
+        // Read the first block before writing the header: if it is the only one, the size of the frame is known.
+        // The header then states it and the matcher sizes its window and tables to it.
+        let mut uncompressed_data = self.state.matcher.get_next_space();
+        let mut last_block = read_block(source, &mut uncompressed_data);
+        let content_size = last_block.then_some(uncompressed_data.len() as u64);
+        if let Some(size) = content_size {
+            self.state.matcher.source_size_hint(size);
+        }
+        if let Some(dict) = &self.dictionary {
+            self.state.matcher.load_dictionary(dict.content());
+        }
+
         // As the frame is compressed, it's stored here
-        let output: &mut Vec<u8> = &mut Vec::with_capacity(1024 * 130);
+        let output: &mut Vec<u8> =
+            &mut Vec::with_capacity(content_size.map_or(1024 * 130, |size| size as usize + 32));
         // First write the frame header
         let header = FrameHeader {
-            frame_content_size: None,
-            single_segment: false,
+            frame_content_size: content_size,
+            single_segment: content_size.is_some(),
             content_checksum: cfg!(feature = "hash"),
             dictionary_id: self
                 .dictionary
@@ -201,23 +212,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         header.serialize(output);
         // Now compress block by block
         loop {
-            // Read a single block's worth of uncompressed data from the input
-            let mut uncompressed_data = self.state.matcher.get_next_space();
-            let mut read_bytes = 0;
-            let last_block;
-            'read_loop: loop {
-                let new_bytes = source.read(&mut uncompressed_data[read_bytes..]).unwrap();
-                if new_bytes == 0 {
-                    last_block = true;
-                    break 'read_loop;
-                }
-                read_bytes += new_bytes;
-                if read_bytes == uncompressed_data.len() {
-                    last_block = false;
-                    break 'read_loop;
-                }
-            }
-            uncompressed_data.resize(read_bytes, 0);
+            let read_bytes = uncompressed_data.len();
             // As we read, hash that data too
             #[cfg(feature = "hash")]
             self.hasher.write(&uncompressed_data);
@@ -258,6 +253,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             if last_block {
                 break;
             }
+            // Read the next block's worth of uncompressed data from the input
+            uncompressed_data = self.state.matcher.get_next_space();
+            last_block = read_block(source, &mut uncompressed_data);
         }
 
         // If the `hash` feature is enabled, then `content_checksum` is set to true in the header
@@ -344,6 +342,35 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// Get the dictionary that is currently used
     pub fn dictionary(&self) -> Option<&Dictionary> {
         self.dictionary.as_ref()
+    }
+}
+
+/// Fill `space` with up to one block of data from `source` and return whether the source is exhausted.
+///
+/// The block is as large as `space`, or the maximum block size if `space` is empty. The space grows as data
+/// arrives, so a small input does not pay for initializing a whole block.
+fn read_block<R: Read>(source: &mut R, space: &mut Vec<u8>) -> bool {
+    let block_size = if space.is_empty() {
+        crate::common::MAX_BLOCK_SIZE as usize
+    } else {
+        usize::min(space.len(), crate::common::MAX_BLOCK_SIZE as usize)
+    };
+    let mut filled = 0;
+    loop {
+        if filled == block_size {
+            space.truncate(filled);
+            return false;
+        }
+        let want = usize::min(block_size, usize::max(4096, 2 * filled));
+        if space.len() < want {
+            space.resize(want, 0);
+        }
+        let new_bytes = source.read(&mut space[filled..want]).unwrap();
+        if new_bytes == 0 {
+            space.truncate(filled);
+            return true;
+        }
+        filled += new_bytes;
     }
 }
 

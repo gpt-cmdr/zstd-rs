@@ -4,9 +4,9 @@ pub(crate) mod block_header;
 pub(crate) mod blocks;
 mod dictionary;
 pub(crate) mod frame_header;
-pub(crate) mod lazy_matcher;
 pub(crate) mod match_generator;
 pub(crate) mod util;
+pub(crate) mod window_matcher;
 
 mod frame_compressor;
 mod levels;
@@ -128,6 +128,9 @@ pub enum CompressionLevel {
 /// This is repeated until no more data is left to be compressed.
 pub trait Matcher {
     /// Get a space where we can put data to be matched on. Will be encoded as one block. The maximum allowed size is 128 kB.
+    ///
+    /// The compressor fills the space up to its length. An empty space is filled up to the maximum block size, the
+    /// compressor resizes it as needed.
     fn get_next_space(&mut self) -> alloc::vec::Vec<u8>;
     /// Get a reference to the last commited space
     fn get_last_space(&mut self) -> &[u8];
@@ -139,9 +142,13 @@ pub trait Matcher {
     fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>));
     /// Reset this matcher so it can be used for the next new frame
     fn reset(&mut self, level: CompressionLevel);
+    /// The total size of the data of the next frame, if it is known. Called after `reset` and before
+    /// `load_dictionary`, `window_size` and the first `commit_space`. Matchers can use it to size their window
+    /// and tables to the input; the default implementation ignores it.
+    fn source_size_hint(&mut self, _size: u64) {}
     /// The size of the window the decoder will need to execute all sequences produced by this matcher
     ///
-    /// May change after a call to reset with a different compression level
+    /// May change after a call to reset with a different compression level or to `source_size_hint`
     fn window_size(&self) -> u64;
     /// Load the content of a dictionary that is used for the next frame. Called right after `reset`,
     /// before the first space is committed.
