@@ -1,16 +1,20 @@
 [package]
-name = "ruzstd"
-version = "0.9.2"
+name = "zstd-rust"
+version = "0.1.0"
 rust-version = "1.87"
-authors = ["Moritz Borcherding <moritz.borcherding@web.de>"]
+authors = [
+    "Moritz Borcherding <moritz.borcherding@web.de>",
+    "William Katzenmeyer / CLB Engineering Corporation",
+]
 edition = "2018"
 license = "MIT"
-homepage = "https://github.com/KillingSpark/zstd-rs"
-repository = "https://github.com/KillingSpark/zstd-rs"
-description = "A decoder for the zstd compression format"
-exclude = ["decodecorpus_files/*", "dict_tests/*", "fuzz_decodecorpus/*"]
+homepage = "https://github.com/gpt-cmdr/zstd-rs"
+repository = "https://github.com/gpt-cmdr/zstd-rs"
+documentation = "https://docs.rs/zstd-rust"
+description = "Pure Rust zstd decoder and compressor: an independently maintained fork of ruzstd with a faster, smaller compressor"
+exclude = ["decodecorpus_files/*", "dict_tests/*", "fuzz_decodecorpus/*", "fuzz/*"]
 readme = "Readme.md"
-keywords = ["zstd", "zstandard", "decompression"]
+keywords = ["zstd", "zstandard", "compression", "decompression", "no-std"]
 categories = ["compression"]
 
 [dependencies]

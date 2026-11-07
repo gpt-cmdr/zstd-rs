@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 
 /// Convenience function to compress some source into a target without reusing any resources of the compressor
 /// ```rust
-/// use ruzstd::encoding::{compress, CompressionLevel};
+/// use zstd_rust::encoding::{compress, CompressionLevel};
 /// let data: &[u8] = &[0,0,0,0,0,0,0,0,0,0,0,0];
 /// let mut target = Vec::new();
 /// compress(data, &mut target, CompressionLevel::Fastest);
@@ -33,7 +33,7 @@ pub fn compress<R: Read, W: Write>(source: R, target: W, level: CompressionLevel
 
 /// Convenience function to compress some source into a Vec without reusing any resources of the compressor
 /// ```rust
-/// use ruzstd::encoding::{compress_to_vec, CompressionLevel};
+/// use zstd_rust::encoding::{compress_to_vec, CompressionLevel};
 /// let data: &[u8] = &[0,0,0,0,0,0,0,0,0,0,0,0];
 /// let compressed = compress_to_vec(data, CompressionLevel::Fastest);
 /// ```
@@ -47,7 +47,7 @@ pub fn compress_to_vec<R: Read>(source: R, level: CompressionLevel) -> Vec<u8> {
 ///
 /// The decoder needs the same dictionary to decompress the frame.
 /// ```rust
-/// use ruzstd::encoding::{compress_with_dictionary, CompressionLevel, Dictionary};
+/// use zstd_rust::encoding::{compress_with_dictionary, CompressionLevel, Dictionary};
 /// let dict = Dictionary::from_raw_content(b"some data that is typical for the inputs".to_vec());
 /// let data: &[u8] = b"some data that is typical for this input";
 /// let mut target = Vec::new();
