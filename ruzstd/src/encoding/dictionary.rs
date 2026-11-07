@@ -24,6 +24,8 @@ use crate::decoding::errors::DictionaryDecodeError;
 pub struct Dictionary {
     id: u32,
     content: Vec<u8>,
+    /// The repeat offsets a frame using this dictionary starts with
+    offset_history: [u32; 3],
 }
 
 impl Dictionary {
@@ -42,7 +44,11 @@ impl Dictionary {
     /// Create a raw content dictionary from arbitrary bytes. It has the ID 0, so no dictionary ID is written into
     /// the frame header.
     pub fn from_raw_content(content: Vec<u8>) -> Dictionary {
-        Dictionary { id: 0, content }
+        Dictionary {
+            id: 0,
+            content,
+            offset_history: crate::encoding::frame_compressor::INITIAL_OFFSET_HISTORY,
+        }
     }
 
     /// Create a dictionary from a parsed decoder dictionary, using its ID and content
@@ -50,6 +56,7 @@ impl Dictionary {
         Dictionary {
             id: dictionary.id,
             content: dictionary.dict_content.clone(),
+            offset_history: dictionary.offset_hist,
         }
     }
 
@@ -61,6 +68,12 @@ impl Dictionary {
     /// The content that can be referenced by the compressed data
     pub fn content(&self) -> &[u8] {
         &self.content
+    }
+
+    /// The repeat offsets a frame starts with when it uses this dictionary. Dictionaries in the Zstd format store
+    /// them, raw content dictionaries use the same ones as frames without a dictionary.
+    pub(crate) fn offset_history(&self) -> [u32; 3] {
+        self.offset_history
     }
 
     /// Consume the dictionary and return its content
@@ -380,6 +393,51 @@ mod tests {
             total_with,
             total_without
         );
+    }
+
+    #[test]
+    fn zstd_format_dictionary_repeat_offsets() {
+        // A dictionary in the Zstd format sets the repeat offsets the decoder starts the frame with. Matches at
+        // the distances 4 and 8 are repeat codes for a frame without a dictionary, so the encoder has to start
+        // from the dictionary's offsets instead or the decoder resolves those codes to other distances.
+        let mut raw = std::fs::read("./dict_tests/dictionary").unwrap();
+        // The corpus dictionary stores the default offsets 1, 4, 8; they are the 12 bytes in front of the content
+        let content_len = Dictionary::parse(&raw).unwrap().content().len();
+        let reps_at = raw.len() - content_len - 12;
+        for (i, rep) in [7u32, 13, 21].iter().enumerate() {
+            raw[reps_at + 4 * i..reps_at + 4 * i + 4].copy_from_slice(&rep.to_le_bytes());
+        }
+        let dict = Dictionary::parse(&raw).unwrap();
+        assert_eq!(dict.offset_history(), [7, 13, 21]);
+        let mut data = b"xyz".to_vec();
+        for _ in 0..50 {
+            data.extend_from_slice(b"abcd");
+        }
+        data.extend_from_slice(&xorshift(100, 5));
+        for _ in 0..50 {
+            data.extend_from_slice(b"12345678");
+        }
+        data.extend_from_slice(&xorshift(100, 6));
+        for _ in 0..50 {
+            data.extend_from_slice(b"wxyz");
+        }
+        for level in LEVELS {
+            let compressed = compress_to_vec_with_dictionary(data.as_slice(), level, &dict);
+            let mut decoder = FrameDecoder::new();
+            decoder
+                .add_dict(crate::decoding::Dictionary::decode_dict(&raw).unwrap())
+                .unwrap();
+            let mut decoded = Vec::with_capacity(data.len());
+            decoder
+                .decode_all_to_vec(&compressed, &mut decoded)
+                .unwrap();
+            assert!(decoded == data, "ruzstd decoded other data at {:?}", level);
+            assert!(
+                decode_zstd(&compressed, &raw) == data,
+                "zstd decoded other data at {:?}",
+                level
+            );
+        }
     }
 
     #[test]

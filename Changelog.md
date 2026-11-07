@@ -13,6 +13,7 @@ This document records the changes made between versions, starting with version 0
   `FrameCompressor::set_dictionary`, `compress_with_dictionary`/`compress_to_vec_with_dictionary`, a default
   `Matcher::load_dictionary` method, `decoding::Dictionary::from_raw_content` and a `--dictionary` option
   for the cli
+* Encode offsets that repeat one of the three most recent offsets as repeat codes when compressing
 
 # After 0.9.0
 
