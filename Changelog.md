@@ -16,6 +16,8 @@ This document records the changes made between versions, starting with version 0
 * Encode offsets that repeat one of the three most recent offsets as repeat codes when compressing
 * The matcher of the `Default`, `Better` and `Best` levels tries the three most recent offsets before the hash chain and
   values matches at them as nearly free
+* Build the Huffman tables for literals from the symbol frequencies (an optimal code limited to 11 bits) instead of from
+  the rank of each symbol only
 
 # After 0.9.0
 

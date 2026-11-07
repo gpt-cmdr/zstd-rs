@@ -361,6 +361,10 @@ fn compress_literals(
     let reset_idx = writer.index();
 
     let new_encoder_table = huff0_encoder::HuffmanTable::build_from_data(literals);
+    if !new_encoder_table.can_be_described() {
+        raw_literals(literals, writer);
+        return None;
+    }
 
     let (encoder_table, new_table) = if let Some(_table) = last_table {
         if let Some(diff) = _table.can_encode(&new_encoder_table) {
