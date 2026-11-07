@@ -107,7 +107,7 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
 ///
 /// When the literal length is zero the repeat codes are shifted by one: 1 and 2 stand for the second and third
 /// recent offset and 3 for the most recent offset minus one.
-fn encode_offset_value(offset: u32, literal_len: u32, history: &mut [u32; 3]) -> u32 {
+pub(crate) fn encode_offset_value(offset: u32, literal_len: u32, history: &mut [u32; 3]) -> u32 {
     debug_assert!(offset > 0);
     let [rep1, rep2, rep3] = *history;
     if literal_len > 0 {

@@ -24,6 +24,8 @@
 use alloc::vec::Vec;
 use core::convert::TryInto;
 
+use super::blocks::encode_offset_value;
+use super::frame_compressor::INITIAL_OFFSET_HISTORY;
 use super::{CompressionLevel, Sequence};
 use crate::common::MAX_BLOCK_SIZE;
 
@@ -259,6 +261,9 @@ pub(crate) struct LazyMatcher {
     /// The tables still hold data of the previous frame and need to be restored before they are used
     tables_dirty: bool,
     dict_snapshot: Option<DictSnapshot>,
+    /// The offset history the encoder will have after the sequences emitted so far. Matches at these offsets are
+    /// encoded as repeat codes, which cost almost no bits, so they are tried before the hash chain.
+    rep: [u32; 3],
     /// Buffers handed out by `get_next_space`
     vec_pool: Vec<Vec<u8>>,
 }
@@ -274,6 +279,7 @@ impl LazyMatcher {
             tables: Tables::new(&params),
             tables_dirty: false,
             dict_snapshot: None,
+            rep: INITIAL_OFFSET_HISTORY,
             vec_pool: Vec::new(),
         }
     }
@@ -296,6 +302,7 @@ impl LazyMatcher {
         self.buf.clear();
         self.block_start = 0;
         self.frame_base = 0;
+        self.rep = INITIAL_OFFSET_HISTORY;
         self.capacity = Self::base_capacity(&params);
         self.buf.shrink_to(self.capacity);
         // Clearing is deferred, a dictionary snapshot might get restored instead
@@ -396,6 +403,7 @@ impl LazyMatcher {
     pub(crate) fn skip_matching(&mut self) {}
 
     pub(crate) fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+        let rep = &mut self.rep;
         let buf = self.buf.as_slice();
         let tables = &mut self.tables;
         let params = &self.params;
@@ -423,8 +431,9 @@ impl LazyMatcher {
         // Lowest index a match may be sourced from
         let src_floor = if dict_usable { 0 } else { frame_base };
 
-        // Searches the tables for the longest match at `ip` and inserts `ip` into the tables
-        let search = |tables: &mut Tables, ip: usize| -> (usize, usize) {
+        // Searches the repeat offsets and the tables for the most valuable match at `ip` and inserts `ip` into the
+        // tables. Returns the length, offset and value (see `score`) of the match; the length is 0 if none was found.
+        let search = |tables: &mut Tables, rep: &[u32; 3], ip: usize| -> (usize, usize, i64) {
             tables.insert_up_to(buf, ip);
             let mut candidate = tables.insert(buf, ip);
             tables.next_to_update = ip + 1;
@@ -434,9 +443,25 @@ impl LazyMatcher {
             } else {
                 usize::max(ip.saturating_sub(window_size), src_floor)
             };
-            let min_chain = ip.saturating_sub(chain_size);
             let mut best_len = 0;
             let mut best_offset = 0;
+            let mut best_score = i64::MIN;
+            for &offset in rep {
+                let offset = offset as usize;
+                if offset > ip || ip - offset < low_limit || offset == best_offset {
+                    continue;
+                }
+                let len = common_prefix_len(buf, ip - offset, ip, block_end);
+                if len >= MIN_MATCH_LEN && score_rep(len) > best_score {
+                    best_len = len;
+                    best_offset = offset;
+                    best_score = score_rep(len);
+                }
+            }
+            if ip + best_len == block_end {
+                return (best_len, best_offset, best_score);
+            }
+            let min_chain = ip.saturating_sub(chain_size);
             for _ in 0..depth {
                 if candidate < low_limit || candidate >= ip {
                     break;
@@ -444,9 +469,16 @@ impl LazyMatcher {
                 // Quick rejection: the byte right after the current best match has to match for a longer match
                 if buf[candidate + best_len] == buf[ip + best_len] {
                     let len = common_prefix_len(buf, candidate, ip, block_end);
-                    if len > best_len {
+                    let offset = ip - candidate;
+                    let value = if rep.contains(&(offset as u32)) {
+                        score_rep(len)
+                    } else {
+                        score(len, offset)
+                    };
+                    if len >= MIN_MATCH_LEN && value > best_score {
                         best_len = len;
-                        best_offset = ip - candidate;
+                        best_offset = offset;
+                        best_score = value;
                         if ip + len == block_end {
                             break;
                         }
@@ -462,14 +494,14 @@ impl LazyMatcher {
                 }
                 candidate = next;
             }
-            (best_len, best_offset)
+            (best_len, best_offset, best_score)
         };
 
         let mut ip = block_start;
         let mut anchor = block_start;
 
         while ip <= ilimit {
-            let (mut match_len, mut offset) = search(tables, ip);
+            let (mut match_len, mut offset, mut value) = search(tables, rep, ip);
             let mut start = ip;
             if match_len < MIN_MATCH_LEN {
                 // Nothing found, skip faster the longer we did not find anything
@@ -481,14 +513,14 @@ impl LazyMatcher {
             let mut lazy_step = 0;
             while lazy_step < params.lazy_steps as usize && ip < ilimit {
                 ip += 1;
-                let (len2, offset2) = search(tables, ip);
+                let (len2, offset2, value2) = search(tables, rep, ip);
                 if len2 >= MIN_MATCH_LEN {
                     // The further we already moved away from `start` the more the new match has to gain
-                    let gain1 = score(match_len, offset) + 4 + 3 * lazy_step as i64;
-                    let gain2 = score(len2, offset2);
-                    if gain2 > gain1 {
+                    let gain1 = value + 4 + 3 * lazy_step as i64;
+                    if value2 > gain1 {
                         match_len = len2;
                         offset = offset2;
+                        value = value2;
                         start = ip;
                         lazy_step = 0;
                         continue;
@@ -506,6 +538,8 @@ impl LazyMatcher {
                 match_len += 1;
             }
 
+            // Track the history the encoder will have, so the next searches know the repeat offsets
+            encode_offset_value(offset as u32, (start - anchor) as u32, rep);
             handle_sequence(Sequence::Triple {
                 literals: &buf[anchor..start],
                 offset,
@@ -528,6 +562,12 @@ impl LazyMatcher {
 #[inline(always)]
 fn score(match_len: usize, offset: usize) -> i64 {
     4 * match_len as i64 - (offset + 1).ilog2() as i64
+}
+
+/// Heuristic value of a match at one of the repeat offsets, which costs almost no offset bits
+#[inline(always)]
+fn score_rep(match_len: usize) -> i64 {
+    4 * match_len as i64
 }
 
 /// Length of the common prefix of `buf[a..]` and `buf[b..end]` where `a < b <= end <= buf.len()`

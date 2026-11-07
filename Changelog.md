@@ -14,6 +14,8 @@ This document records the changes made between versions, starting with version 0
   `Matcher::load_dictionary` method, `decoding::Dictionary::from_raw_content` and a `--dictionary` option
   for the cli
 * Encode offsets that repeat one of the three most recent offsets as repeat codes when compressing
+* The matcher of the `Default`, `Better` and `Best` levels tries the three most recent offsets before the hash chain and
+  values matches at them as nearly free
 
 # After 0.9.0
 
