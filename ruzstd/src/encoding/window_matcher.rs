@@ -1549,10 +1549,11 @@ fn insert_in_row<const ROW: usize>(tags: &mut [u8], positions: &mut [u32], h: us
 
 /// Asks the processor to fetch the cache line of `slice[index]`, which is about to be read.
 ///
-/// Only where the standard library has a stable instruction for it. Elsewhere the element is read instead, which
-/// has the same effect as long as the processor runs ahead of the read.
+/// Only on the processors with an instruction for it that Rust can name (x86-64 and AArch64); nothing happens
+/// elsewhere. A read in place of the instruction is no substitute: the processor has to wait for it.
 #[inline(always)]
 fn prefetch<T: Copy>(slice: &[T], index: usize) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if let Some(item) = slice.get(index) {
         #[cfg(target_arch = "x86_64")]
         {
@@ -1563,10 +1564,22 @@ fn prefetch<T: Copy>(slice: &[T], index: usize) {
                 _mm_prefetch::<_MM_HINT_T0>(core::ptr::from_ref(item).cast::<i8>())
             };
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
         {
-            core::hint::black_box(*item);
+            // SAFETY: a prefetch reads no memory and raises no fault, and the pointer is that of an element
+            // of the slice. The instruction changes no register, no flag and nothing on the stack.
+            unsafe {
+                core::arch::asm!(
+                    "prfm pldl1keep, [{address}]",
+                    address = in(reg) core::ptr::from_ref(item),
+                    options(nostack, preserves_flags, readonly),
+                )
+            };
         }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = (slice, index);
     }
 }
 
