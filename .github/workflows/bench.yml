@@ -1,9 +1,10 @@
 name: Benchmark against the C library
 
-# Times the crate against the zstd C library on tiles of public rasters, on each kind of hosted runner.
-# Run it by hand (Actions, "Run workflow") or by pushing a branch named bench/* (the repository has a branch named ci, so ci/... names cannot exist). Shared runners are
-# noisy: compare the ratios to the C library, which ran on the same machine in the same job, and run it
-# more than once.
+# Times the crate against the zstd C library on tiles of public rasters, on the hosted Linux (x86-64 and
+# AArch64) and Windows runners. macOS runners are left out on purpose. Run it by hand (Actions, "Run
+# workflow") or by pushing a branch named bench/* (the repository has a branch named ci, so ci/... names
+# cannot exist). Shared runners are noisy and differ in their processors: compare the ratios to the C
+# library, which ran on the same machine in the same job, and run it more than once.
 on:
   workflow_dispatch:
     inputs:
@@ -29,7 +30,6 @@ jobs:
         include:
           - os: ubuntu-latest
           - os: ubuntu-24.04-arm
-          - os: macos-latest
           - os: windows-latest
           # The C library decodes Huffman streams with hand-written assembly on x86-64 (not with MSVC, and
           # not on other processors). This job builds it without, to tell how much of a difference on
@@ -88,8 +88,6 @@ jobs:
           case "$RUNNER_OS" in
             Linux) cpu=$(lscpu | sed -n 's/^Model name: *//p' | head -n 1)
                    cores=$(nproc) ;;
-            macOS) cpu=$(sysctl -n machdep.cpu.brand_string)
-                   cores=$(sysctl -n hw.ncpu) ;;
             Windows) cpu=$(powershell -NoProfile -Command "(Get-CimInstance Win32_Processor | Select-Object -First 1).Name")
                      cores=$NUMBER_OF_PROCESSORS ;;
           esac
