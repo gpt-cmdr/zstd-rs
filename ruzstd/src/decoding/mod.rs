@@ -11,6 +11,7 @@ pub use streaming_decoder::StreamingDecoder;
 pub(crate) mod block_decoder;
 pub(crate) mod decode_buffer;
 pub(crate) mod dictionary;
+mod direct;
 pub(crate) mod frame;
 pub(crate) mod literals_section_decoder;
 mod ringbuffer;

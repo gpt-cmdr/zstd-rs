@@ -94,6 +94,11 @@ impl FSETable {
         }
     }
 
+    /// Sets the largest symbol the table may hold.
+    pub(crate) fn set_max_symbol(&mut self, max_symbol: u8) {
+        self.max_symbol = max_symbol;
+    }
+
     /// Reset `self` and update `self`'s state to mirror the provided table.
     pub fn reinit_from(&mut self, other: &Self) {
         self.reset();

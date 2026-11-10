@@ -7,6 +7,7 @@
 use super::frame;
 use crate::decoding;
 use crate::decoding::dictionary::Dictionary;
+use crate::decoding::direct::{DirectError, DirectScratch};
 use crate::decoding::errors::FrameDecoderError;
 use crate::decoding::scratch::DecoderScratch;
 use crate::io::{Error, Read, Write};
@@ -81,6 +82,8 @@ pub struct FrameDecoder {
     state: Option<FrameDecoderState>,
     dicts: BTreeMap<u32, Dictionary>,
     max_window_size: u64,
+    /// The tables and buffers of [`FrameDecoder::decode_all`], allocated at its first call.
+    direct: Option<alloc::boxed::Box<DirectScratch>>,
 }
 
 struct FrameDecoderState {
@@ -160,6 +163,7 @@ impl FrameDecoder {
             state: None,
             dicts: BTreeMap::new(),
             max_window_size: DEFAULT_MAX_WINDOW_SIZE,
+            direct: None,
         }
     }
 
@@ -545,18 +549,32 @@ impl FrameDecoder {
     ) -> Result<usize, FrameDecoderError> {
         let mut total_bytes_written = 0;
         while !input.is_empty() {
-            match self.init(&mut input) {
-                Ok(_) => {}
-                Err(FrameDecoderError::ReadFrameHeaderError(
+            // A frame is decoded straight into `output`, which is then its own window. Frames
+            // with a dictionary or a checksum go through the window buffer of the streaming
+            // decoder below, which keeps the dictionary and the checksum.
+            let max_window_size = self.max_window_size;
+            let direct = self
+                .direct
+                .get_or_insert_with(|| alloc::boxed::Box::new(DirectScratch::new()));
+            match direct.decode_frame(input, output, max_window_size) {
+                Ok((read, written)) => {
+                    input = &input[read..];
+                    output = &mut output[written..];
+                    total_bytes_written += written;
+                    continue;
+                }
+                Err(DirectError::Failed(FrameDecoderError::ReadFrameHeaderError(
                     crate::decoding::errors::ReadFrameHeaderError::SkipFrame { length, .. },
-                )) => {
+                ))) => {
                     input = input
-                        .get(length as usize..)
+                        .get(8 + length as usize..)
                         .ok_or(FrameDecoderError::FailedToSkipFrame)?;
                     continue;
                 }
-                Err(e) => return Err(e),
-            };
+                Err(DirectError::Failed(e)) => return Err(e),
+                Err(DirectError::Unsupported) => {}
+            }
+            self.init(&mut input)?;
             loop {
                 self.decode_blocks(&mut input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
                 let bytes_written = self

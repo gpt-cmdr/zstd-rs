@@ -1,9 +1,10 @@
 //! Utilities for decoding Huff0 encoded huffman data.
 
-use crate::bit_io::BitReaderReversed;
+use crate::bit_io::{BackBits, BitReaderReversed};
 use crate::decoding::errors::HuffmanTableError;
 use crate::fse::{FSEDecoder, FSETable};
 use alloc::vec::Vec;
+use core::convert::TryInto;
 
 /// The Zstandard specification limits the maximum length of a code to 11 bits.
 pub(crate) const MAX_MAX_NUM_BITS: u8 = 11;
@@ -56,6 +57,10 @@ impl<'t> HuffmanDecoder<'t> {
 /// A Huffman decoding table contains a list of Huffman prefix codes and their associated values
 pub struct HuffmanTable {
     decode: Vec<Entry>,
+    /// `decode` widened to [`MAX_MAX_NUM_BITS`] bits, each entry a symbol (low byte) and its
+    /// number of bits (high byte): the table of [`HuffmanTable::decode_stream`] and
+    /// [`HuffmanTable::decode_four_streams`], indexed by the next 11 bits of a stream.
+    fast: Vec<u16>,
     /// The weight of a symbol is the number of occurences in a table.
     /// This value is used in constructing a binary tree referred to as
     /// a Huffman tree. Once this tree is constructed, it can be used to build the
@@ -78,6 +83,7 @@ impl HuffmanTable {
     pub fn new() -> HuffmanTable {
         HuffmanTable {
             decode: Vec::new(),
+            fast: Vec::new(),
 
             weights: Vec::with_capacity(256),
             max_num_bits: 0,
@@ -93,6 +99,7 @@ impl HuffmanTable {
     pub fn reinit_from(&mut self, other: &Self) {
         self.reset();
         self.decode.extend_from_slice(&other.decode);
+        self.fast.extend_from_slice(&other.fast);
         self.weights.extend_from_slice(&other.weights);
         self.max_num_bits = other.max_num_bits;
         self.bits.extend_from_slice(&other.bits);
@@ -103,6 +110,7 @@ impl HuffmanTable {
     /// Completely empty the table of all data.
     pub fn reset(&mut self) {
         self.decode.clear();
+        self.fast.clear();
         self.weights.clear();
         self.max_num_bits = 0;
         self.bits.clear();
@@ -373,10 +381,125 @@ impl HuffmanTable {
             }
         }
 
+        // Each entry repeated to fill an 11-bit table.
+        let repeat = 1usize << (MAX_MAX_NUM_BITS - max_bits);
+        self.fast.clear();
+        self.fast.reserve(FAST_TABLE_SIZE);
+        for entry in &self.decode {
+            let packed = u16::from(entry.symbol) | (u16::from(entry.num_bits) << 8);
+            self.fast.extend(core::iter::repeat_n(packed, repeat));
+        }
+
         Ok(())
+    }
+
+    /// Decodes one stream of Huffman codes into exactly `out`, or `None` when the stream is not
+    /// exactly that many symbols (or there is no table).
+    pub(crate) fn decode_stream(&self, src: &[u8], out: &mut [u8]) -> Option<()> {
+        let table: &[u16; FAST_TABLE_SIZE] = self.fast.as_slice().try_into().ok()?;
+        let mut bits = BackBits::new(src)?;
+        // 56 bits are ready after a reload (and at the start): five symbols of at most 11.
+        let mut done = 0;
+        while bits.can_reload_fast() {
+            let Some(chunk) = out.get_mut(done..done + SYMBOLS_PER_RELOAD) else {
+                break;
+            };
+            for byte in chunk.iter_mut() {
+                *byte = symbol(table, &mut bits);
+            }
+            bits.reload_fast();
+            done += SYMBOLS_PER_RELOAD;
+        }
+        finish_stream(table, bits, &mut out[done..])
+    }
+
+    /// Decodes the four streams of a literals section into exactly `out`: the first three streams
+    /// each hold a quarter of the symbols (rounded up), the fourth the rest. `None` when a stream
+    /// is not exactly its symbols (or there is no table).
+    ///
+    /// The four streams are decoded side by side, a symbol of each in turn, so that the processor
+    /// works on four independent chains of lookups at once: that, and refilling once per five
+    /// symbols, is where the speed of Huffman decoding comes from.
+    pub(crate) fn decode_four_streams(&self, src: [&[u8]; 4], out: &mut [u8]) -> Option<()> {
+        let table: &[u16; FAST_TABLE_SIZE] = self.fast.as_slice().try_into().ok()?;
+        let segment = out.len().div_ceil(4);
+        if segment * 3 > out.len() {
+            return None;
+        }
+        let (out0, rest) = out.split_at_mut(segment);
+        let (out1, rest) = rest.split_at_mut(segment);
+        let (out2, out3) = rest.split_at_mut(segment);
+        let mut b0 = BackBits::new(src[0])?;
+        let mut b1 = BackBits::new(src[1])?;
+        let mut b2 = BackBits::new(src[2])?;
+        let mut b3 = BackBits::new(src[3])?;
+
+        const N: usize = SYMBOLS_PER_RELOAD;
+        let mut done = 0;
+        {
+            let mut c0 = out0.chunks_exact_mut(N);
+            let mut c1 = out1.chunks_exact_mut(N);
+            let mut c2 = out2.chunks_exact_mut(N);
+            let mut c3 = out3.chunks_exact_mut(N);
+            while b0.can_reload_fast()
+                && b1.can_reload_fast()
+                && b2.can_reload_fast()
+                && b3.can_reload_fast()
+            {
+                let (Some(o0), Some(o1), Some(o2), Some(o3)) =
+                    (c0.next(), c1.next(), c2.next(), c3.next())
+                else {
+                    break;
+                };
+                for i in 0..N {
+                    o0[i] = symbol(table, &mut b0);
+                    o1[i] = symbol(table, &mut b1);
+                    o2[i] = symbol(table, &mut b2);
+                    o3[i] = symbol(table, &mut b3);
+                }
+                b0.reload_fast();
+                b1.reload_fast();
+                b2.reload_fast();
+                b3.reload_fast();
+                done += N;
+            }
+        }
+        // `out3` may be up to three symbols shorter than the others, so `done` is within each.
+        finish_stream(table, b0, &mut out0[done..])?;
+        finish_stream(table, b1, &mut out1[done..])?;
+        finish_stream(table, b2, &mut out2[done..])?;
+        finish_stream(table, b3, &mut out3[done..])
     }
 }
 
+/// The size of [`HuffmanTable::fast`].
+const FAST_TABLE_SIZE: usize = 1 << MAX_MAX_NUM_BITS;
+/// The symbols decoded between two reloads: 56 bits are ready, a symbol takes at most 11.
+const SYMBOLS_PER_RELOAD: usize = 5;
+
+/// The next symbol of `bits`.
+#[inline(always)]
+fn symbol(table: &[u16; FAST_TABLE_SIZE], bits: &mut BackBits<'_>) -> u8 {
+    let entry = table[(bits.bits >> (64 - MAX_MAX_NUM_BITS)) as usize];
+    let num_bits = (entry >> 8) as u32;
+    bits.bits <<= num_bits;
+    bits.consumed += num_bits;
+    entry as u8
+}
+
+/// The last symbols of a stream, reloading before each: `None` unless the stream ends with them.
+fn finish_stream(
+    table: &[u16; FAST_TABLE_SIZE],
+    mut bits: BackBits<'_>,
+    out: &mut [u8],
+) -> Option<()> {
+    for byte in out.iter_mut() {
+        bits.reload();
+        *byte = symbol(table, &mut bits);
+    }
+    bits.reload();
+    bits.finished().then_some(())
+}
 impl Default for HuffmanTable {
     fn default() -> Self {
         Self::new()
