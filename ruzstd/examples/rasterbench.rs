@@ -6,6 +6,13 @@
 //! the length of a chunk in decimal (`name_p2.raw` and `name_p3.raw` share the `.len` of `name`). Each chunk
 //! is a frame. `RUNS` sets the number of timed runs (the best counts), `LEVEL` restricts the levels to one,
 //! `NOREUSE` compresses with `compress_to_vec` instead of a `Compressor`.
+//! `DECODE_ONLY=<seconds>` and `STREAM_ONLY=<seconds>` first loop `decode_all` or the streaming decoder (read
+//! in pieces) for that long, to profile them.
+//!
+//! Decoding is timed four ways, each as the time of `zstd::bulk::decompress` times x: "C stream" and "rust
+//! stream" read the stream decoder of either library in pieces, through `Read::take` into a vector that
+//! starts empty; "to end" is `StreamingDecoder::read_to_end` itself, which decodes straight into the vector;
+//! "rust all" is `FrameDecoder::decode_all`.
 use std::io::Read;
 use std::time::Instant;
 use zstd_rust::decoding::{FrameDecoder, StreamingDecoder};
@@ -155,6 +162,50 @@ fn main() {
                         .map(|f| zstd::bulk::decompress(f, len).unwrap().len())
                         .sum::<usize>()
                 });
+                if let Ok(seconds) = std::env::var("STREAM_ONLY") {
+                    // For profiling: only the streaming decoder, for that many seconds
+                    let until = Instant::now()
+                        + std::time::Duration::from_secs_f64(seconds.parse().unwrap());
+                    while Instant::now() < until {
+                        for f in &c {
+                            let mut out = Vec::new();
+                            let mut src = &f[..];
+                            StreamingDecoder::new(&mut src)
+                                .unwrap()
+                                .take(len as u64)
+                                .read_to_end(&mut out)
+                                .unwrap();
+                        }
+                    }
+                }
+                let (dcs, _) = best(runs, || {
+                    c.iter()
+                        .map(|f| {
+                            let mut out = Vec::new();
+                            zstd::stream::read::Decoder::new(&f[..])
+                                .unwrap()
+                                .take(len as u64)
+                                .read_to_end(&mut out)
+                                .unwrap();
+                            assert_eq!(out.len(), len);
+                            out.len()
+                        })
+                        .sum::<usize>()
+                });
+                let (de, _) = best(runs, || {
+                    c.iter()
+                        .map(|f| {
+                            let mut out = Vec::new();
+                            let mut src = &f[..];
+                            StreamingDecoder::new(&mut src)
+                                .unwrap()
+                                .read_to_end(&mut out)
+                                .unwrap();
+                            assert_eq!(out.len(), len);
+                            out.len()
+                        })
+                        .sum::<usize>()
+                });
                 let (ds, _) = best(runs, || {
                     c.iter()
                         .map(|f| {
@@ -198,10 +249,13 @@ fn main() {
                     assert_eq!(&out[..], *b);
                 }
                 println!(
-                    "DEC {name:18} L{l:<2} C {:7.1} MB/s | rust stream {:7.1} (x{:.2}) | rust all {:7.1} (x{:.2})",
+                    "DEC {name:18} L{l:<2} C {:7.1} MB/s (stream x{:.2}) | rust stream {:7.1} (x{:.2}) | to end {:7.1} (x{:.2}) | rust all {:7.1} (x{:.2})",
                     mb / dc,
+                    dcs / dc,
                     mb / ds,
                     ds / dc,
+                    mb / de,
+                    de / dc,
                     mb / da,
                     da / dc
                 );
