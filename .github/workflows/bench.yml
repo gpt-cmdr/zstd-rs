@@ -24,8 +24,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        # Every job is listed: an `include` entry that only names an existing `os` would change that job
+        # instead of adding one.
         include:
+          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
+          - os: macos-latest
+          - os: windows-latest
           # The C library decodes Huffman streams with hand-written assembly on x86-64 (not with MSVC, and
           # not on other processors). This job builds it without, to tell how much of a difference on
           # Linux x86-64 is the assembly and how much the C compiler.
