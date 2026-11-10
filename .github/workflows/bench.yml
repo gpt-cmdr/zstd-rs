@@ -50,6 +50,16 @@ jobs:
             variant: GNU toolchain
             artifact: -gnu
             target: x86_64-pc-windows-gnu
+          # Decoding into one buffer instead of a new one for every frame (REUSE_OUT of the example):
+          # what allocating the output costs differs between the systems, and it costs both libraries
+          - os: ubuntu-latest
+            variant: output buffer reused
+            artifact: -reuse
+            reuse_out: "1"
+          - os: windows-latest
+            variant: output buffer reused
+            artifact: -reuse
+            reuse_out: "1"
     defaults:
       run:
         shell: bash
@@ -58,6 +68,7 @@ jobs:
       CFLAGS: ${{ matrix.cflags }}
       RUSTFLAGS: ${{ matrix.rustflags }}
       CARGO_BUILD_TARGET: ${{ matrix.target }}
+      REUSE_OUT: ${{ matrix.reuse_out }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
