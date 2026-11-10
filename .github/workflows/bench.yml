@@ -16,24 +16,29 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: bench-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   rasterbench:
-    name: rasterbench ${{ matrix.os }}
+    name: rasterbench ${{ matrix.os }}${{ matrix.variant && format(' ({0})', matrix.variant) || '' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        include:
+          # The C library decodes Huffman streams with hand-written assembly on x86-64 (not with MSVC, and
+          # not on other processors). This job builds it without, to tell how much of a difference on
+          # Linux x86-64 is the assembly and how much the C compiler.
+          - os: ubuntu-latest
+            variant: C library without assembly
+            artifact: -no-asm
+            cflags: -DZSTD_DISABLE_ASM
     defaults:
       run:
         shell: bash
     env:
       RUNS: ${{ inputs.runs || '7' }}
+      CFLAGS: ${{ matrix.cflags }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -57,7 +62,7 @@ jobs:
                      cores=$NUMBER_OF_PROCESSORS ;;
           esac
           {
-            echo "## rasterbench on ${{ matrix.os }}"
+            echo "## rasterbench on ${{ matrix.os }}${{ matrix.variant && format(' ({0})', matrix.variant) || '' }}"
             echo
             echo "- CPU: $(echo "$cpu" | tr -d '\r') ($cores logical cores, $RUNNER_ARCH)"
             echo "- Image: $ImageOS $ImageVersion"
@@ -70,7 +75,10 @@ jobs:
         run: |
           cargo build --release --example rasterbench
           tree=$(cargo tree -p zstd-rust --prefix none)
-          echo "- C library: $(grep '^zstd-sys' <<< "$tree" | sort -u)" | tee -a machine.md
+          echo "- C library: $(grep '^zstd-sys' <<< "$tree" | sort -u), CFLAGS \"$CFLAGS\"" | tee -a machine.md
+          if [ "$RUNNER_OS" != Windows ]; then
+            echo "- Symbols of the C library's Huffman assembly in the binary: $(nm target/release/examples/rasterbench | grep -c fast_asm_loop || true)" | tee -a machine.md
+          fi
 
       - name: Download the rasters and cut them into chunks
         run: |
@@ -103,7 +111,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rasterbench-${{ matrix.os }}
+          name: rasterbench-${{ matrix.os }}${{ matrix.artifact }}
           path: |
             summary.md
             machine.md
