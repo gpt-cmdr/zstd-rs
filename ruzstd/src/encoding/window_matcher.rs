@@ -452,11 +452,16 @@ impl WindowMatcher {
         self.tables.resize(&self.params, row_log);
         self.capacity =
             self.params.window_size() + dict_len + SLACK_BLOCKS * MAX_BLOCK_SIZE as usize;
-        if self.size_hint.is_none() {
-            // Growing the buffer block by block would copy the data again at every doubling. Reserving the whole
-            // buffer only costs address space, the pages are used as the data arrives.
-            self.buf.reserve(self.capacity);
-        }
+        // Growing the buffer block by block would copy the data again at every doubling. Reserving the whole
+        // buffer only costs address space, the pages are used as the data arrives.
+        let expected = match self.size_hint {
+            Some(size) => usize::try_from(size)
+                .unwrap_or(usize::MAX)
+                .saturating_add(dict_len)
+                .min(self.capacity),
+            None => self.capacity,
+        };
+        self.buf.reserve(expected);
     }
 
     /// Place dictionary content in front of the data of the next frame. Must be called right after `reset` (and
@@ -562,7 +567,26 @@ impl WindowMatcher {
     }
 
     pub(crate) fn commit_space(&mut self, mut space: Vec<u8>) {
-        assert!(space.len() <= MAX_BLOCK_SIZE as usize);
+        self.make_room(space.len());
+        if self.buf.is_empty() && self.buf.capacity() < space.len() {
+            // Take over the space instead of copying it
+            core::mem::swap(&mut self.buf, &mut space);
+        } else {
+            self.buf.extend_from_slice(&space);
+        }
+        space.clear();
+        self.vec_pool.push(space);
+    }
+
+    /// As [`Self::commit_space`], for a block that is not in a space of this matcher: one copy instead of two
+    pub(crate) fn commit_slice(&mut self, block: &[u8]) {
+        self.make_room(block.len());
+        self.buf.extend_from_slice(block);
+    }
+
+    /// Make room in the buffer for a block of `len` bytes, which starts at the end of the buffer
+    fn make_room(&mut self, len: usize) {
+        assert!(len <= MAX_BLOCK_SIZE as usize);
         self.setup(0);
         if self.dict_snapshot.is_none() || self.frame_base == 0 {
             // No dictionary in this frame
@@ -570,7 +594,7 @@ impl WindowMatcher {
                 self.tables.stop_tracking();
             }
         }
-        if self.buf.len() + space.len() > self.capacity {
+        if self.buf.len() + len > self.capacity {
             // Drop everything that is older than one window before the start of the new block. The absolute
             // positions of the remaining data stay the same.
             let keep = usize::min(self.buf.len(), self.params.window_size());
@@ -588,14 +612,6 @@ impl WindowMatcher {
             }
         }
         self.block_start = self.buf.len();
-        if self.buf.is_empty() && self.buf.capacity() < space.len() {
-            // Take over the space instead of copying it
-            core::mem::swap(&mut self.buf, &mut space);
-        } else {
-            self.buf.extend_from_slice(&space);
-        }
-        space.clear();
-        self.vec_pool.push(space);
     }
 
     /// Nothing to do here. The next search starts at the next block; the positions of this block

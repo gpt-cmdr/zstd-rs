@@ -29,11 +29,21 @@ pub fn compress_matched_block<M: Matcher>(
     uncompressed_data: Vec<u8>,
     output: &mut Vec<u8>,
 ) {
-    let block_size = uncompressed_data.len() as u32;
+    state.matcher.commit_space(uncompressed_data);
+    compress_committed_block(state, last_block, output)
+}
+
+/// As [`compress_matched_block`], for a block that was committed to the matcher already: its last space.
+pub(crate) fn compress_committed_block<M: Matcher>(
+    state: &mut CompressState<M>,
+    last_block: bool,
+    output: &mut Vec<u8>,
+) {
+    let block = state.matcher.get_last_space();
+    let block_size = block.len() as u32;
     // First check to see if run length encoding can be used for the entire block
-    if uncompressed_data.iter().all(|x| uncompressed_data[0].eq(x)) {
-        let rle_byte = uncompressed_data[0];
-        state.matcher.commit_space(uncompressed_data);
+    if block.iter().all(|x| block[0].eq(x)) {
+        let rle_byte = block[0];
         state.matcher.skip_matching();
         let header = BlockHeader {
             last_block,
@@ -45,7 +55,6 @@ pub fn compress_matched_block<M: Matcher>(
         output.push(rle_byte);
     } else {
         // Compress as a standard compressed block, right behind a placeholder for its header
-        state.matcher.commit_space(uncompressed_data);
         let header_at = output.len();
         output.extend_from_slice(&[0; 3]);
         let entropy = compress_block(state, output);
