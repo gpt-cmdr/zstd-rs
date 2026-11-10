@@ -240,12 +240,15 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
             .rchunks_exact(SYMBOLS)
             .map(|symbols| gather(symbols, codes))
             .chain(core::iter::once(gather(head, codes)));
+        // The symbols not written yet, each of at most 11 bits: the output grows by no more than they need
+        let mut remaining = data.len();
         for gathered in groups {
             let count = 63 - gathered.leading_zeros();
             word |= (gathered ^ (1 << count)) << bits;
             if output.len() < at + 8 {
-                output.resize(at + 8 + ROOM, 0);
+                output.resize(at + 8 + usize::min(ROOM, remaining * 11 / 8 + 16), 0);
             }
+            remaining = remaining.saturating_sub(SYMBOLS);
             output[at..at + 8].copy_from_slice(&word.to_le_bytes());
             // At most 62 bits were gathered: seven bytes at most are complete
             bits += count;
