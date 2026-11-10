@@ -5,7 +5,10 @@
 //! The directory holds `name.raw` files of chunks one after another and, for each, a `name.len` file with
 //! the length of a chunk in decimal (`name_p2.raw` and `name_p3.raw` share the `.len` of `name`). Each chunk
 //! is a frame. `RUNS` sets the number of timed runs (the best counts), `LEVEL` restricts the levels to one,
-//! `NOREUSE` compresses with `compress_to_vec` instead of a `Compressor`.
+//! `NOREUSE` compresses with `compress_to_vec` instead of a `Compressor`. `REUSE_OUT` decodes every frame into
+//! the same buffer, with one decoder of the C library, instead of into a new buffer each (and a new decoder of
+//! the C library each): allocating the output costs both libraries the same, more on some systems than on
+//! others, which hides a part of the difference between them.
 use std::io::Read;
 use std::time::Instant;
 use zstd_rust::decoding::{FrameDecoder, StreamingDecoder};
@@ -96,6 +99,7 @@ fn main() {
         .collect();
     names.sort();
     let only: Option<i32> = std::env::var("LEVEL").ok().and_then(|v| v.parse().ok());
+    let reuse_out = std::env::var("REUSE_OUT").is_ok_and(|v| !v.is_empty());
     for name in names {
         let raw = std::fs::read(format!("{dir}/{name}")).unwrap();
         let stem = name
@@ -150,15 +154,28 @@ fn main() {
                 );
             }
             if mode != "enc" {
+                let mut shared = vec![0u8; len];
+                let mut c_decoder = zstd::bulk::Decompressor::new().unwrap();
                 let (dc, _) = best(runs, || {
                     c.iter()
-                        .map(|f| zstd::bulk::decompress(f, len).unwrap().len())
+                        .map(|f| {
+                            if reuse_out {
+                                c_decoder.decompress_to_buffer(f, &mut shared[..]).unwrap()
+                            } else {
+                                zstd::bulk::decompress(f, len).unwrap().len()
+                            }
+                        })
                         .sum::<usize>()
                 });
                 let (ds, _) = best(runs, || {
                     c.iter()
                         .map(|f| {
-                            let mut out = Vec::new();
+                            let mut out = if reuse_out {
+                                shared.clear();
+                                core::mem::take(&mut shared)
+                            } else {
+                                Vec::new()
+                            };
                             let mut src = &f[..];
                             StreamingDecoder::new(&mut src)
                                 .unwrap()
@@ -166,7 +183,10 @@ fn main() {
                                 .read_to_end(&mut out)
                                 .unwrap();
                             assert_eq!(out.len(), len);
-                            out.len()
+                            if reuse_out {
+                                shared = out;
+                            }
+                            len
                         })
                         .sum::<usize>()
                 });
@@ -185,8 +205,12 @@ fn main() {
                 let (da, _) = best(runs, || {
                     c.iter()
                         .map(|f| {
-                            let mut out = vec![0u8; len];
-                            let n = fd.decode_all(f, &mut out).unwrap();
+                            let n = if reuse_out {
+                                fd.decode_all(f, &mut shared).unwrap()
+                            } else {
+                                let mut out = vec![0u8; len];
+                                fd.decode_all(f, &mut out).unwrap()
+                            };
                             assert_eq!(n, len);
                             n
                         })
