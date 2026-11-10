@@ -84,6 +84,8 @@ pub struct FrameDecoder {
     max_window_size: u64,
     /// The tables and buffers of [`FrameDecoder::decode_all`], allocated at its first call.
     direct: Option<alloc::boxed::Box<DirectScratch>>,
+    /// Whether the last frame was decoded by [`FrameDecoder::decode_all`] without `state`.
+    last_frame_direct: bool,
 }
 
 struct FrameDecoderState {
@@ -164,6 +166,7 @@ impl FrameDecoder {
             dicts: BTreeMap::new(),
             max_window_size: DEFAULT_MAX_WINDOW_SIZE,
             direct: None,
+            last_frame_direct: false,
         }
     }
 
@@ -203,6 +206,7 @@ impl FrameDecoder {
     /// equivalent to init()
     pub fn reset(&mut self, source: impl Read) -> Result<(), FrameDecoderError> {
         use FrameDecoderError as err;
+        self.last_frame_direct = false;
         let state = match &mut self.state {
             Some(s) => {
                 s.reset(source, self.max_window_size)?;
@@ -256,6 +260,9 @@ impl FrameDecoder {
 
     /// Returns the checksum that was read from the data. Only available after all bytes have been read. It is the last 4 bytes of a zstd-frame
     pub fn get_checksum_from_data(&self) -> Option<u32> {
+        if let Some(checksum) = self.direct_checksum() {
+            return Some(checksum.from_data);
+        }
         let state = self.state.as_ref()?;
 
         state.check_sum
@@ -267,10 +274,23 @@ impl FrameDecoder {
     pub fn get_calculated_checksum(&self) -> Option<u32> {
         use core::hash::Hasher;
 
+        if let Some(checksum) = self.direct_checksum() {
+            return checksum.calculated;
+        }
         let state = self.state.as_ref()?;
         let cksum_64bit = state.decoder_scratch.buffer.hash.finish();
         //truncate to lower 32bit because reasons...
         Some(cksum_64bit as u32)
+    }
+
+    /// The checksum of the last frame, when [`FrameDecoder::decode_all`] decoded it without the state of
+    /// the streaming decoder.
+    fn direct_checksum(&self) -> Option<crate::decoding::direct::FrameChecksum> {
+        if self.last_frame_direct {
+            self.direct.as_ref()?.checksum
+        } else {
+            None
+        }
     }
 
     /// Counter for how many bytes have been consumed while decoding the frame
@@ -550,14 +570,15 @@ impl FrameDecoder {
         let mut total_bytes_written = 0;
         while !input.is_empty() {
             // A frame is decoded straight into `output`, which is then its own window. Frames
-            // with a dictionary or a checksum go through the window buffer of the streaming
-            // decoder below, which keeps the dictionary and the checksum.
+            // with a dictionary go through the window buffer of the streaming decoder below,
+            // which holds the content of the dictionary.
             let max_window_size = self.max_window_size;
             let direct = self
                 .direct
                 .get_or_insert_with(|| alloc::boxed::Box::new(DirectScratch::new()));
             match direct.decode_frame(input, output, max_window_size) {
                 Ok((read, written)) => {
+                    self.last_frame_direct = true;
                     input = &input[read..];
                     output = &mut output[written..];
                     total_bytes_written += written;

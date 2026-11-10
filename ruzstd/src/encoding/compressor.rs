@@ -130,7 +130,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::with_capacity(len);
         while out.len() < len {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            if out.len() > 100 && (state >> 20) % 16 == 0 {
+            if out.len() > 100 && (state >> 20) & 15 == 0 {
                 let from = (state as usize >> 8) % (out.len() - 40);
                 for i in 0..40 {
                     out.push(out[from + i]);

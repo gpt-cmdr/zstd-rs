@@ -92,8 +92,9 @@ pub enum CompressionLevel {
     Uncompressed,
     /// This level is roughly equivalent to Zstd compression level 1.
     ///
-    /// Uses one hash table of 6-byte prefixes and greedy matching (the reference implementation's `fast`
-    /// strategy) over a 512 KiB window. Memory usage of the matcher is about 1.3 MiB.
+    /// Uses one hash table of 7-byte prefixes (6-byte ones for data of up to 256 KiB, 5-byte ones up to 16 KiB)
+    /// and greedy matching (the reference implementation's `fast` strategy) over a 512 KiB window. Memory usage
+    /// of the matcher is about 1.3 MiB.
     Fastest,
     /// This level is roughly equivalent to Zstd level 3,
     /// or the one used by the official compressor when no level
@@ -102,11 +103,14 @@ pub enum CompressionLevel {
     /// Uses a hash table of 8-byte and one of 5-byte prefixes and greedy matching (the reference
     /// implementation's `dfast` strategy) over a 2 MiB window. Memory usage of the matcher is about 3.3 MiB.
     Default,
-    /// Uses hash chains (depth 32) with a two-byte lazy match evaluation over a 4 MiB window.
-    /// Memory usage of the matcher is about 7.5 MiB.
+    /// This level is roughly equivalent to Zstd level 9.
+    ///
+    /// Uses rows of 16 tagged positions (the reference implementation's row match finder; hash chains of
+    /// depth 16 in frames with a dictionary) with a two-byte lazy match evaluation over a 4 MiB window. Memory
+    /// usage of the matcher is about 7.5 MiB.
     Better,
-    /// Uses hash chains (depth 128) with a two-byte lazy match evaluation over a 8 MiB window.
-    /// Memory usage of the matcher is about 14.5 MiB.
+    /// Uses rows of 64 tagged positions (hash chains of depth 128 in frames with a dictionary) with a two-byte
+    /// lazy match evaluation over a 8 MiB window. Memory usage of the matcher is about 14.5 MiB.
     Best,
 }
 

@@ -1,5 +1,6 @@
 //! `FrameDecoder::decode_all` (frames decoded straight into the output) against the streaming
 //! decoder, which decodes through a window buffer.
+#![cfg(test)]
 
 use crate::decoding::{FrameDecoder, StreamingDecoder};
 use crate::io::Read;
@@ -172,4 +173,33 @@ fn damaged_frames_do_not_panic() {
         }
     }
     assert!(agreed > 0);
+}
+
+/// Frames that end with a checksum: the checksum is that of the content, the decoder reports
+/// both, and content that does not have the checksum of its frame is an error.
+#[cfg(feature = "hash")]
+#[test]
+fn checks_the_checksum_of_a_frame() {
+    use crate::decoding::errors::FrameDecoderError;
+    let data = sample(300_000, 3);
+    // The frames of the stream compressor end with a checksum (with the `hash` feature)
+    let frame =
+        crate::encoding::compress_to_vec(&data[..], crate::encoding::CompressionLevel::Default);
+    let mut decoder = FrameDecoder::new();
+    let mut out = vec![0; data.len()];
+    assert_eq!(decoder.decode_all(&frame, &mut out).unwrap(), data.len());
+    assert!(out == data);
+    let from_data = decoder.get_checksum_from_data().unwrap();
+    assert_eq!(from_data.to_le_bytes(), frame[frame.len() - 4..]);
+    assert_eq!(decoder.get_calculated_checksum(), Some(from_data));
+
+    let mut wrong = frame.clone();
+    let last = wrong.len() - 1;
+    wrong[last] ^= 0x40;
+    assert!(matches!(
+        decoder.decode_all(&wrong, &mut out),
+        Err(FrameDecoderError::ChecksumMismatch { .. })
+    ));
+    // Without its last byte the frame has no whole checksum
+    assert!(decoder.decode_all(&frame[..last], &mut out).is_err());
 }

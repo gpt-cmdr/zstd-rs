@@ -1,5 +1,5 @@
 //! Decoding of whole frames from a slice into a slice: the path of
-//! [`FrameDecoder::decode_all`](super::FrameDecoder::decode_all).
+//! [`FrameDecoder::decode_all`](super::FrameDecoder::decode_all), for frames without a dictionary.
 //!
 //! The streaming decoder keeps a window in a ring buffer, decodes the sequences of a block into a
 //! vector, executes them into the ring buffer and copies the result out. With the whole output in
@@ -150,11 +150,21 @@ pub(crate) struct DirectScratch {
     predefined: Option<Box<Predefined>>,
     literals: Vec<u8>,
     offset_hist: [u32; 3],
+    /// The checksum of the last frame decoded, if it has one.
+    pub(crate) checksum: Option<FrameChecksum>,
+}
+
+/// The checksum a frame ends with, and the one of the content decoded (with the `hash` feature).
+#[derive(Clone, Copy)]
+pub(crate) struct FrameChecksum {
+    pub(crate) from_data: u32,
+    #[cfg_attr(not(feature = "hash"), allow(dead_code))]
+    pub(crate) calculated: Option<u32>,
 }
 
 /// Why a frame was not decoded by this path.
 pub(crate) enum DirectError {
-    /// The frame needs what only the streaming decoder does (a dictionary).
+    /// The frame needs what only the streaming decoder has (a dictionary).
     Unsupported,
     Failed(FrameDecoderError),
 }
@@ -191,6 +201,7 @@ impl DirectScratch {
             predefined: None,
             literals: Vec::new(),
             offset_hist: [1, 4, 8],
+            checksum: None,
         }
     }
 
@@ -299,11 +310,37 @@ impl DirectScratch {
                 break;
             }
         }
+        let mut checksum = None;
         if header.descriptor.content_checksum_flag() {
-            source = source.get(4..).ok_or_else(|| {
-                FrameDecoderError::FailedToReadChecksum(Error::from(ErrorKind::UnexpectedEof))
-            })?;
+            let Some((bytes, rest)) = source.split_first_chunk::<4>() else {
+                return Err(FrameDecoderError::FailedToReadChecksum(Error::from(
+                    ErrorKind::UnexpectedEof,
+                ))
+                .into());
+            };
+            source = rest;
+            let expected = u32::from_le_bytes(*bytes);
+            // The checksum is the low half of the XXH64 of the content
+            #[cfg(feature = "hash")]
+            let calculated = {
+                let calculated = twox_hash::XxHash64::oneshot(0, &output[..pos]) as u32;
+                if calculated != expected {
+                    return Err(FrameDecoderError::ChecksumMismatch {
+                        expected,
+                        calculated,
+                    }
+                    .into());
+                }
+                Some(calculated)
+            };
+            #[cfg(not(feature = "hash"))]
+            let calculated = None;
+            checksum = Some(FrameChecksum {
+                from_data: expected,
+                calculated,
+            });
         }
+        self.checksum = checksum;
         Ok((input.len() - source.len(), pos))
     }
 

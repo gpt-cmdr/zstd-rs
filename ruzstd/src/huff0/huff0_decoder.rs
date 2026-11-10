@@ -9,51 +9,6 @@ use core::convert::TryInto;
 /// The Zstandard specification limits the maximum length of a code to 11 bits.
 pub(crate) const MAX_MAX_NUM_BITS: u8 = 11;
 
-pub struct HuffmanDecoder<'table> {
-    table: &'table HuffmanTable,
-    /// State is used to index into the table.
-    pub state: u64,
-}
-
-impl<'t> HuffmanDecoder<'t> {
-    /// Create a new decoder with the provided table
-    pub fn new(table: &'t HuffmanTable) -> HuffmanDecoder<'t> {
-        HuffmanDecoder { table, state: 0 }
-    }
-
-    /// Decode the symbol the internal state (cursor) is pointed at and return the
-    /// decoded literal.
-    pub fn decode_symbol(&mut self) -> u8 {
-        self.table.decode[self.state as usize].symbol
-    }
-
-    /// Initialize internal state and prepare to decode data. Then, `decode_symbol` can be called
-    /// to read the byte the internal cursor is pointing at, and `next_state` can be called to advance
-    /// the cursor until the max number of bits has been read.
-    pub fn init_state(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
-        let num_bits = self.table.max_num_bits;
-        let new_bits = br.get_bits(num_bits);
-        self.state = new_bits;
-        num_bits
-    }
-
-    /// Advance the internal cursor to the next symbol. After this, you can call `decode_symbol`
-    /// to read from the new position.
-    pub fn next_state(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
-        // self.state stores a small section, or a window of the bit stream. The table can be indexed via this state,
-        // telling you how many bits identify the current symbol.
-        let num_bits = self.table.decode[self.state as usize].num_bits;
-        // New bits are read from the stream
-        let new_bits = br.get_bits(num_bits);
-        // Shift and mask out the bits that identify the current symbol
-        self.state <<= num_bits;
-        self.state &= self.table.decode.len() as u64 - 1;
-        // The new bits are appended at the end of the current state.
-        self.state |= new_bits;
-        num_bits
-    }
-}
-
 /// A Huffman decoding table contains a list of Huffman prefix codes and their associated values
 pub struct HuffmanTable {
     decode: Vec<Entry>,

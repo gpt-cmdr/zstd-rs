@@ -169,14 +169,29 @@ pub struct HuffmanTable {
 
 impl HuffmanTable {
     pub fn build_from_data(data: &[u8]) -> Self {
-        let mut counts = [0; 256];
+        // Four tables, a byte in four counted in each: counting a symbol again right away then does not wait
+        // for the count just written
+        let mut parts = [[0u32; 256]; 4];
+        let mut chunks = data.chunks_exact(4);
+        for chunk in &mut chunks {
+            parts[0][chunk[0] as usize] += 1;
+            parts[1][chunk[1] as usize] += 1;
+            parts[2][chunk[2] as usize] += 1;
+            parts[3][chunk[3] as usize] += 1;
+        }
+        for x in chunks.remainder() {
+            parts[0][*x as usize] += 1;
+        }
+        let mut counts = [0usize; 256];
         let mut max = 0;
-        for x in data {
-            counts[*x as usize] += 1;
-            max = max.max(*x);
+        for (symbol, count) in counts.iter_mut().enumerate() {
+            *count = parts.iter().map(|part| part[symbol] as usize).sum();
+            if *count != 0 {
+                max = symbol;
+            }
         }
 
-        Self::build_from_counts(&counts[..=max as usize])
+        Self::build_from_counts(&counts[..=max])
     }
 
     /// Build an optimal prefix code for symbols with the given counts, limited to the maximum code length of the
