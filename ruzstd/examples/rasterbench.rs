@@ -171,6 +171,17 @@ fn main() {
                         .sum::<usize>()
                 });
                 let mut fd = FrameDecoder::new();
+                if let Ok(seconds) = std::env::var("DECODE_ONLY") {
+                    // For profiling: only the decoding of whole frames, for that many seconds
+                    let until = Instant::now()
+                        + std::time::Duration::from_secs_f64(seconds.parse().unwrap());
+                    let mut out = vec![0u8; len];
+                    while Instant::now() < until {
+                        for f in &c {
+                            fd.decode_all(f, &mut out).unwrap();
+                        }
+                    }
+                }
                 let (da, _) = best(runs, || {
                     c.iter()
                         .map(|f| {

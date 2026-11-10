@@ -723,15 +723,32 @@ fn execute(
         }
         literals_pos = literals_end;
 
-        // The match, which may overlap what it writes.
+        // The match, which may overlap what it writes. Most matches are short: sixteen bytes at
+        // once from sixteen bytes back or more, eight at a time from eight back or more (each
+        // eight are then written before they are read again), byte by byte from closer.
         let from = match_start - offset;
         if offset >= 16 && match_len <= 16 && match_start + 16 <= output.len() {
             output.copy_within(from..from + 16, match_start);
+        } else if offset >= 8 && match_len <= 32 && match_start + 32 <= output.len() {
+            let mut copied = 0;
+            while copied < match_len {
+                output.copy_within(from + copied..from + copied + 8, match_start + copied);
+                copied += 8;
+            }
         } else if offset >= match_len {
             output.copy_within(from..from + match_len, match_start);
         } else if offset == 1 {
             let byte = output[from];
             output[match_start..match_end].fill(byte);
+        } else if match_len <= 32 {
+            let (history, target) = output.split_at_mut(match_start);
+            let target = &mut target[..match_len];
+            // The bytes of the match not yet written are those written `offset` bytes before.
+            let (first, rest) = target.split_at_mut(offset);
+            first.copy_from_slice(&history[from..]);
+            for at in 0..rest.len() {
+                target[offset + at] = target[at];
+            }
         } else {
             // The bytes repeat with period `offset`: each copy doubles what is there to copy.
             let mut copied = 0;
