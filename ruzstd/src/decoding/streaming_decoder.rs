@@ -7,6 +7,19 @@ use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
 #[cfg(not(feature = "std"))]
 use crate::io::ErrorKind;
 use crate::io::{Error, Read};
+use alloc::vec::Vec;
+
+/// The error of the decoder as one of the reader.
+fn io_error(e: FrameDecoderError) -> Error {
+    #[cfg(feature = "std")]
+    {
+        Error::other(e)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        Error::new(ErrorKind::Other, alloc::boxed::Box::new(e))
+    }
+}
 
 /// High level Zstandard frame decoder that can be used to decompress a given Zstandard frame.
 ///
@@ -17,6 +30,13 @@ use crate::io::{Error, Read};
 /// the lower level [FrameDecoder], which allows for greater control over how
 /// decompression takes place but the implementor must call
 /// [FrameDecoder::decode_blocks] repeatedly to decode the entire frame.
+///
+/// ## Speed
+/// `read_to_end` on a decoder that was not read from yet decodes the frame straight into the
+/// vector. Reading in pieces decodes into the window buffer of the decoder and copies from
+/// there. That buffer is as large as the window of the frame (as its content, for a frame that
+/// states a smaller size): to decode many frames, keep the [FrameDecoder] and pass it to
+/// [StreamingDecoder::new_with_decoder], so that the buffer is allocated once.
 ///
 /// ## Caveat
 /// [StreamingDecoder] expects the underlying stream to only contain a single frame,
@@ -126,23 +146,33 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
         // Loop until the decoder has decoded far enough for us to collect at least some bytes
         // Returning 0 bytes here would signal an EOF which would be wrong when the decoder is not yet finished
         while decoder.can_collect() == 0 && !decoder.is_finished() {
-            match decoder.decode_blocks(&mut self.source, BlockDecodingStrategy::UptoBlocks(1)) {
-                Ok(_) => { /*Nothing to do*/ }
-                Err(e) => {
-                    let err;
-                    #[cfg(feature = "std")]
-                    {
-                        err = Error::other(e);
-                    }
-                    #[cfg(not(feature = "std"))]
-                    {
-                        err = Error::new(ErrorKind::Other, alloc::boxed::Box::new(e));
-                    }
-                    return Err(err);
-                }
-            }
+            decoder
+                .decode_blocks(&mut self.source, BlockDecodingStrategy::UptoBlocks(1))
+                .map_err(io_error)?;
         }
 
         decoder.read(buf)
+    }
+
+    /// Reads the rest of the frame. When nothing of it was read yet it is decoded straight into
+    /// `buf`, without the copy through the window that reading in pieces takes.
+    #[cfg(feature = "std")]
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize, Error> {
+        let start = buf.len();
+        let result = self
+            .decoder
+            .borrow_mut()
+            .decode_to_end(&mut self.source, buf);
+        result.map(|()| buf.len() - start).map_err(io_error)
+    }
+
+    /// Reads the rest of the frame. When nothing of it was read yet it is decoded straight into
+    /// `output`, without the copy through the window that reading in pieces takes.
+    #[cfg(not(feature = "std"))]
+    fn read_to_end(&mut self, output: &mut Vec<u8>) -> Result<(), Error> {
+        self.decoder
+            .borrow_mut()
+            .decode_to_end(&mut self.source, output)
+            .map_err(io_error)
     }
 }

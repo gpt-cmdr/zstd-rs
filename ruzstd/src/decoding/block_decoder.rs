@@ -1,18 +1,12 @@
 use super::super::blocks::block::BlockHeader;
 use super::super::blocks::block::BlockType;
-use super::super::blocks::literals_section::LiteralsSection;
-use super::super::blocks::literals_section::LiteralsSectionType;
-use super::super::blocks::sequence_section::SequencesHeader;
-use super::literals_section_decoder::decode_literals;
-use super::sequence_section_decoder::decode_sequences;
 use crate::common::MAX_BLOCK_SIZE;
-use crate::decoding::errors::DecodeSequenceError;
+use crate::decoding::direct::BlockError;
 use crate::decoding::errors::{
     BlockHeaderReadError, BlockSizeError, BlockTypeError, DecodeBlockContentError,
     DecompressBlockError,
 };
 use crate::decoding::scratch::DecoderScratch;
-use crate::decoding::sequence_execution::execute_sequences;
 use crate::io::Read;
 
 pub struct BlockDecoder {
@@ -51,7 +45,7 @@ impl BlockDecoder {
         }
 
         // Block_Maximum_Size (RFC 8878 3.1.1.2.4): the smaller of the window and 128 KiB
-        let max_block_len = (workspace.buffer.window_size).min(MAX_BLOCK_SIZE as usize);
+        let max_block_len = workspace.buffer.max_block_len();
         // raw and RLE blocks state their size, compressed ones are checked as they decode
         Self::check_decompressed_size(header.decompressed_size as usize, max_block_len)?;
 
@@ -116,97 +110,31 @@ impl BlockDecoder {
         workspace
             .block_content_buffer
             .resize(header.content_size as usize, 0);
-
         source.read_exact(workspace.block_content_buffer.as_mut_slice())?;
-        let raw = workspace.block_content_buffer.as_slice();
 
-        let mut section = LiteralsSection::new();
-        let bytes_in_literals_header = section.parse_from_header(raw)?;
-        let raw = &raw[bytes_in_literals_header as usize..];
-        vprintln!(
-            "Found {} literalssection with regenerated size: {}, and compressed size: {:?}",
-            section.ls_type,
-            section.regenerated_size,
-            section.compressed_size
-        );
-        // every literal ends up in the output, so the literals alone must fit in the block
-        Self::check_decompressed_size(section.regenerated_size as usize, max_block_decoded_len)?;
-
-        let upper_limit_for_literals = match section.compressed_size {
-            Some(x) => x as usize,
-            None => match section.ls_type {
-                LiteralsSectionType::RLE => 1,
-                LiteralsSectionType::Raw => section.regenerated_size as usize,
-                _ => panic!("Bug in this library"),
-            },
-        };
-
-        if raw.len() < upper_limit_for_literals {
-            return Err(DecompressBlockError::MalformedSectionHeader {
-                expected_len: upper_limit_for_literals,
-                remaining_bytes: raw.len(),
-            });
-        }
-
-        let raw_literals = &raw[..upper_limit_for_literals];
-        vprintln!("Slice for literals: {}", raw_literals.len());
-
-        workspace.literals_buffer.clear(); //all literals of the previous block must have been used in the sequence execution anyways. just be defensive here
-        let bytes_used_in_literals_section = decode_literals(
-            &section,
-            &mut workspace.huf,
-            raw_literals,
-            &mut workspace.literals_buffer,
-        )?;
-        assert!(
-            section.regenerated_size == workspace.literals_buffer.len() as u32,
-            "Wrong number of literals: {}, Should have been: {}",
-            workspace.literals_buffer.len(),
-            section.regenerated_size
-        );
-        assert!(bytes_used_in_literals_section == upper_limit_for_literals as u32);
-
-        let raw = &raw[upper_limit_for_literals..];
-        vprintln!("Slice for sequences with headers: {}", raw.len());
-
-        let mut seq_section = SequencesHeader::new();
-        let bytes_in_sequence_header = seq_section.parse_from_header(raw)?;
-        let raw = &raw[bytes_in_sequence_header as usize..];
-        vprintln!(
-            "Found sequencessection with sequences: {} and size: {}",
-            seq_section.num_sequences,
-            raw.len()
-        );
-
-        assert!(
-            u32::from(bytes_in_literals_header)
-                + bytes_used_in_literals_section
-                + u32::from(bytes_in_sequence_header)
-                + raw.len() as u32
-                == header.content_size
-        );
-        vprintln!("Slice for sequences: {}", raw.len());
-
-        if seq_section.num_sequences != 0 {
-            decode_sequences(
-                &seq_section,
-                raw,
-                &mut workspace.fse,
-                &mut workspace.sequences,
-            )?;
-            vprintln!("Executing sequences");
-            execute_sequences(workspace, max_block_decoded_len)?;
-        } else {
-            if !raw.is_empty() {
-                return Err(DecompressBlockError::DecodeSequenceError(
-                    DecodeSequenceError::ExtraBits {
-                        bits_remaining: raw.len() as isize * 8,
-                    },
-                ));
-            }
-            workspace.buffer.push(&workspace.literals_buffer);
-            workspace.sequences.clear();
-        }
+        // The block is decoded straight into the window, after its newest bytes
+        let target = workspace.buffer.block_target();
+        let room = (target.output.len() - target.pos).min(max_block_decoded_len);
+        let end = workspace
+            .block
+            .decode_block(
+                &workspace.block_content_buffer,
+                target.output,
+                target.pos,
+                max_block_decoded_len,
+                &target.history,
+            )
+            .map_err(|e| match e {
+                BlockError::Failed(e) => e,
+                // The window has room for a block of the largest size. Only the vector of a
+                // reader may have less: what the frame states its content takes.
+                BlockError::TargetTooSmall => DecompressBlockError::DecompressedSizeTooLarge {
+                    at_least: room + 1,
+                    max: room,
+                },
+            })?;
+        let decoded = end - target.pos;
+        workspace.buffer.commit(decoded);
 
         Ok(())
     }

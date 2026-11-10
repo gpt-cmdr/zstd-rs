@@ -112,11 +112,12 @@ impl FrameDecoderState {
         let (frame, header_size) = frame::read_frame_header(source)?;
         let window_size = frame.window_size()?;
         Self::check_window_size(window_size, max_window_size)?;
+        let content_size = Self::stated_content_size(&frame);
         Ok(FrameDecoderState {
             frame_header: frame,
             frame_finished: false,
             block_counter: 0,
-            decoder_scratch: DecoderScratch::new(window_size as usize),
+            decoder_scratch: DecoderScratch::new(window_size as usize, content_size),
             bytes_read_counter: u64::from(header_size),
             check_sum: None,
             using_dict: None,
@@ -128,14 +129,23 @@ impl FrameDecoderState {
         let window_size = frame_header.window_size()?;
         Self::check_window_size(window_size, max_window_size)?;
 
+        let content_size = Self::stated_content_size(&frame_header);
         self.frame_header = frame_header;
         self.frame_finished = false;
         self.block_counter = 0;
-        self.decoder_scratch.reset(window_size as usize);
+        self.decoder_scratch
+            .reset(window_size as usize, content_size);
         self.bytes_read_counter = u64::from(header_size);
         self.check_sum = None;
         self.using_dict = None;
         Ok(())
+    }
+
+    /// The size of the content, if the frame header states one.
+    fn stated_content_size(header: &frame::FrameHeader) -> Option<u64> {
+        let stated = header.descriptor.single_segment_flag()
+            || header.descriptor.frame_content_size_flag() != 0;
+        stated.then(|| header.frame_content_size())
     }
 
     /// Reject a frame whose declared window exceeds the limit, before allocation.
@@ -398,6 +408,45 @@ impl FrameDecoder {
         }
 
         Ok(state.frame_finished)
+    }
+
+    /// Decodes what is left of the frame and appends it to `output`, after the bytes that were
+    /// decoded but not collected yet.
+    pub(crate) fn decode_to_end(
+        &mut self,
+        mut source: impl Read,
+        output: &mut Vec<u8>,
+    ) -> Result<(), FrameDecoderError> {
+        use FrameDecoderError as err;
+        let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
+        if state.decoder_scratch.buffer.len() == 0 && !state.frame_finished {
+            // Nothing of the frame is in the window: `output` is the window for the rest, which
+            // is decoded straight into it. Should `source` panic, `output` is left empty.
+            let own = state.decoder_scratch.buffer.lend(output);
+            let result = loop {
+                match self.decode_blocks(&mut source, BlockDecodingStrategy::UptoBlocks(1)) {
+                    Ok(true) => break Ok(()),
+                    Ok(false) => {}
+                    Err(e) => break Err(e),
+                }
+                if let Some(state) = self.state.as_mut() {
+                    state.decoder_scratch.buffer.hash_lent();
+                }
+            };
+            if let Some(state) = self.state.as_mut() {
+                state.decoder_scratch.buffer.take_back(own, output);
+            }
+            return result;
+        }
+        // Block by block through the window, each collected while it is in the cache
+        while !self.is_finished() {
+            self.decode_blocks(&mut source, BlockDecodingStrategy::UptoBlocks(1))?;
+            self.collect_to_writer(&mut *output)
+                .map_err(err::FailedToDrainDecodebuffer)?;
+        }
+        self.collect_to_writer(&mut *output)
+            .map_err(err::FailedToDrainDecodebuffer)?;
+        Ok(())
     }
 
     /// Collect bytes and retain window_size bytes while decoding is still going on.

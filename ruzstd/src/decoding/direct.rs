@@ -1,12 +1,18 @@
-//! Decoding of whole frames from a slice into a slice: the path of
-//! [`FrameDecoder::decode_all`](super::FrameDecoder::decode_all), for frames without a dictionary.
+//! Decoding of compressed blocks into a slice, and of whole frames from a slice into a slice.
 //!
-//! The streaming decoder keeps a window in a ring buffer, decodes the sequences of a block into a
-//! vector, executes them into the ring buffer and copies the result out. With the whole output in
-//! one slice none of that is needed: the output is its own window, sequences are executed as they
-//! are decoded, and blocks are read in place from the input. The layout follows the reference
-//! decoder's (`zstd_decompress_block.c`): sequence tables hold the base value and extra bits of
-//! each state, and the bitstream is refilled at most twice per sequence.
+//! [`BlockScratch::decode_block`] decodes a block to a position of a slice whose bytes before
+//! that position are the window: sequences are executed as they are decoded. The layout follows
+//! the reference decoder's (`zstd_decompress_block.c`): sequence tables hold the base value and
+//! extra bits of each state, and the bitstream is refilled at most twice per sequence. Both
+//! decoders use it:
+//!
+//! * [`FrameDecoder::decode_all`](super::FrameDecoder::decode_all), for frames without a
+//!   dictionary, through [`DirectScratch::decode_frame`]: the output slice is its own window and
+//!   blocks are read in place from the input.
+//! * The streaming decoder, whose window is the
+//!   [`DecodeBuffer`](super::decode_buffer::DecodeBuffer). Its matches may also reach bytes that
+//!   are not in the slice a block is decoded to: an older part of the window and the content of a
+//!   dictionary, the [`History`].
 
 use super::frame;
 use crate::bit_io::BackBits;
@@ -17,9 +23,10 @@ use crate::blocks::sequence_section::{
     MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
 };
 use crate::common::MAX_BLOCK_SIZE;
+use crate::decoding::dictionary::Dictionary;
 use crate::decoding::errors::{
-    DecodeBlockContentError, DecodeSequenceError, DecompressBlockError, DecompressLiteralsError,
-    ExecuteSequencesError, FSEDecoderError, FrameDecoderError,
+    DecodeBlockContentError, DecodeBufferError, DecodeSequenceError, DecompressBlockError,
+    DecompressLiteralsError, ExecuteSequencesError, FSEDecoderError, FrameDecoderError,
 };
 use crate::decoding::sequence_section_decoder::{
     LITERALS_LENGTH_DEFAULT_DISTRIBUTION, LL_DEFAULT_ACC_LOG, LL_MAX_LOG,
@@ -96,6 +103,23 @@ impl SeqTable {
         self.accuracy_log = other.accuracy_log;
         self.defined = true;
     }
+
+    /// The table a dictionary starts a frame with: that of its FSE table or of its single code,
+    /// and none when the dictionary has neither (a dictionary of content only).
+    fn set_from_dict(
+        &mut self,
+        table: &FSETable,
+        rle: Option<u8>,
+        codes: &dyn Fn(u8) -> (u32, u8),
+    ) {
+        if let Some(code) = rle {
+            self.set_rle(codes(code));
+        } else if table.accuracy_log != 0 && table.decode.len() == 1usize << table.accuracy_log {
+            self.set_fse(table, codes);
+        } else {
+            self.defined = false;
+        }
+    }
 }
 
 /// The base and extra bits of a literal length code.
@@ -140,8 +164,9 @@ struct Predefined {
     ml: SeqTable,
 }
 
-/// What decoding keeps from block to block and from frame to frame (as allocations).
-pub(crate) struct DirectScratch {
+/// What the blocks of a frame keep from one to the next: the tables a block may repeat and the
+/// last three offsets. The allocations are kept from frame to frame.
+pub(crate) struct BlockScratch {
     huf: HuffmanTable,
     fse: FSETable,
     ll: SeqTable,
@@ -150,8 +175,41 @@ pub(crate) struct DirectScratch {
     predefined: Option<Box<Predefined>>,
     literals: Vec<u8>,
     offset_hist: [u32; 3],
+}
+
+/// What [`FrameDecoder::decode_all`](super::FrameDecoder::decode_all) keeps between frames.
+pub(crate) struct DirectScratch {
+    block: BlockScratch,
     /// The checksum of the last frame decoded, if it has one.
     pub(crate) checksum: Option<FrameChecksum>,
+}
+
+/// The bytes before those of the slice a block is decoded to that its matches may reach. From
+/// the newest to the oldest: the slice up to the position of the block, `window`, `dict`.
+pub(crate) struct History<'a> {
+    /// The older part of the window, when the window is not in one piece.
+    pub(crate) window: &'a [u8],
+    /// The content of the dictionary of the frame.
+    pub(crate) dict: &'a [u8],
+    /// Matches that start before this position of the slice may reach into the dictionary: a
+    /// frame may refer to its dictionary until it has decoded more than its window size.
+    pub(crate) dict_end: usize,
+}
+
+impl History<'_> {
+    /// Nothing but the slice itself.
+    pub(crate) const NONE: History<'static> = History {
+        window: &[],
+        dict: &[],
+        dict_end: 0,
+    };
+}
+
+/// Why a block was not decoded.
+pub(crate) enum BlockError {
+    /// The slice ends before the block does.
+    TargetTooSmall,
+    Failed(DecompressBlockError),
 }
 
 /// The checksum a frame ends with, and the one of the content decoded (with the `hash` feature).
@@ -175,10 +233,19 @@ impl From<FrameDecoderError> for DirectError {
     }
 }
 
-fn block_error(e: impl Into<DecompressBlockError>) -> DirectError {
-    DirectError::Failed(FrameDecoderError::FailedToReadBlockBody(
-        DecodeBlockContentError::DecompressBlockError(e.into()),
-    ))
+impl From<BlockError> for DirectError {
+    fn from(e: BlockError) -> Self {
+        DirectError::Failed(match e {
+            BlockError::TargetTooSmall => FrameDecoderError::TargetTooSmall,
+            BlockError::Failed(e) => FrameDecoderError::FailedToReadBlockBody(
+                DecodeBlockContentError::DecompressBlockError(e),
+            ),
+        })
+    }
+}
+
+fn block_error(e: impl Into<DecompressBlockError>) -> BlockError {
+    BlockError::Failed(e.into())
 }
 
 fn truncated(step: BlockType) -> DirectError {
@@ -193,14 +260,7 @@ fn truncated(step: BlockType) -> DirectError {
 impl DirectScratch {
     pub(crate) fn new() -> Self {
         DirectScratch {
-            huf: HuffmanTable::new(),
-            fse: FSETable::new(255),
-            ll: SeqTable::new(),
-            of: SeqTable::new(),
-            ml: SeqTable::new(),
-            predefined: None,
-            literals: Vec::new(),
-            offset_hist: [1, 4, 8],
+            block: BlockScratch::new(),
             checksum: None,
         }
     }
@@ -236,11 +296,7 @@ impl DirectScratch {
             .unwrap_or(usize::MAX)
             .min(MAX_BLOCK_SIZE as usize);
 
-        self.huf.reset();
-        self.ll.defined = false;
-        self.of.defined = false;
-        self.ml.defined = false;
-        self.offset_hist = [1, 4, 8];
+        self.block.reset();
 
         let mut pos = 0;
         loop {
@@ -297,7 +353,13 @@ impl DirectScratch {
                         return Err(truncated(BlockType::Compressed));
                     };
                     source = rest;
-                    pos = self.decode_block(block, output, pos, max_block_len)?;
+                    pos = self.block.decode_block(
+                        block,
+                        output,
+                        pos,
+                        max_block_len,
+                        &History::NONE,
+                    )?;
                 }
                 _ => {
                     return Err(FrameDecoderError::FailedToReadBlockHeader(
@@ -343,16 +405,57 @@ impl DirectScratch {
         self.checksum = checksum;
         Ok((input.len() - source.len(), pos))
     }
+}
 
-    /// Decodes a compressed block to `output[pos..]`, after the `pos` bytes of the frame already
-    /// there: the position after the block.
-    fn decode_block(
+impl BlockScratch {
+    pub(crate) fn new() -> Self {
+        BlockScratch {
+            huf: HuffmanTable::new(),
+            fse: FSETable::new(255),
+            ll: SeqTable::new(),
+            of: SeqTable::new(),
+            ml: SeqTable::new(),
+            predefined: None,
+            literals: Vec::new(),
+            offset_hist: [1, 4, 8],
+        }
+    }
+
+    /// The state a frame without a dictionary starts with.
+    pub(crate) fn reset(&mut self) {
+        self.huf.reset();
+        self.ll.defined = false;
+        self.of.defined = false;
+        self.ml.defined = false;
+        self.offset_hist = [1, 4, 8];
+    }
+
+    /// The state a frame with `dict` starts with: its tables, which the first block may repeat,
+    /// and its offsets.
+    pub(crate) fn init_from_dict(&mut self, dict: &Dictionary) {
+        self.huf.reinit_from(&dict.huf.table);
+        self.ll
+            .set_from_dict(&dict.fse.literal_lengths, dict.fse.ll_rle, &ll_code);
+        self.of
+            .set_from_dict(&dict.fse.offsets, dict.fse.of_rle, &of_code);
+        self.ml
+            .set_from_dict(&dict.fse.match_lengths, dict.fse.ml_rle, &ml_code);
+        self.offset_hist = dict.offset_hist;
+    }
+
+    /// Decodes a compressed block to `output[pos..]`: the position after the block.
+    ///
+    /// The `pos` bytes before are the window, with `history` before them. The block decodes to
+    /// no more than `max_block_len` bytes. Up to 32 bytes after those of the block may be written
+    /// to, where `output` has them.
+    pub(crate) fn decode_block(
         &mut self,
         block: &[u8],
         output: &mut [u8],
         pos: usize,
         max_block_len: usize,
-    ) -> Result<usize, DirectError> {
+        history: &History<'_>,
+    ) -> Result<usize, BlockError> {
         let mut section = LiteralsSection::new();
         let header_len = usize::from(section.parse_from_header(block).map_err(block_error)?);
         let raw = block.get(header_len..).unwrap_or_default();
@@ -396,7 +499,7 @@ impl DirectScratch {
             }
             output
                 .get_mut(pos..pos + literals.len())
-                .ok_or(FrameDecoderError::TargetTooSmall)?
+                .ok_or(BlockError::TargetTooSmall)?
                 .copy_from_slice(literals);
             return Ok(pos + literals.len());
         }
@@ -420,11 +523,12 @@ impl DirectScratch {
             output,
             pos,
             max_block_len,
+            history,
         )
     }
 }
 
-fn check_block_len(at_least: usize, max: usize) -> Result<(), DirectError> {
+fn check_block_len(at_least: usize, max: usize) -> Result<(), BlockError> {
     if at_least > max {
         return Err(block_error(
             DecompressBlockError::DecompressedSizeTooLarge { at_least, max },
@@ -604,9 +708,63 @@ fn update_tables(
     Ok(read)
 }
 
+/// Copies the match of `match_len` bytes at `offset` to `output[match_start..]`, where it starts
+/// before `output` does: in `history`, from which it may run on into `output`.
+#[inline(never)]
+pub(crate) fn copy_from_history(
+    output: &mut [u8],
+    match_start: usize,
+    match_len: usize,
+    offset: usize,
+    history: &History<'_>,
+) -> Result<(), ExecuteSequencesError> {
+    let target = &mut output[..match_start + match_len];
+    // The bytes of the match that are before `output`, if it is long enough
+    let mut before = offset - match_start;
+    let mut at = match_start;
+    if before > history.window.len() {
+        let need = before - history.window.len();
+        if match_start >= history.dict_end {
+            return Err(DecodeBufferError::OffsetTooBig {
+                offset,
+                buf_len: match_start + history.window.len(),
+            }
+            .into());
+        }
+        if need > history.dict.len() {
+            return Err(DecodeBufferError::NotEnoughBytesInDictionary {
+                got: history.dict.len(),
+                need,
+            }
+            .into());
+        }
+        let n = need.min(target.len() - at);
+        let from = history.dict.len() - need;
+        target[at..at + n].copy_from_slice(&history.dict[from..from + n]);
+        at += n;
+        before -= n;
+    }
+    if at < target.len() && before > 0 {
+        let n = before.min(target.len() - at);
+        let from = history.window.len() - before;
+        target[at..at + n].copy_from_slice(&history.window[from..from + n]);
+        at += n;
+    }
+    // The rest is at the start of `output`, and may run into what it writes: then the bytes
+    // repeat with period `at`, and each copy doubles what is there to copy. `at` is not 0
+    // here: the match has bytes before `output`, which were copied above.
+    let mut copied = 0;
+    while at + copied < target.len() {
+        let n = (at + copied).min(target.len() - at - copied);
+        target.copy_within(..n, at + copied);
+        copied += n;
+    }
+    Ok(())
+}
+
 /// Decodes the `count` sequences of `stream` and executes them: literals from `literals` and
-/// matches from the output itself go to `output[pos..]`, the `pos` bytes before being the frame
-/// so far. The position after the block.
+/// matches from the output itself (or from `history`, before it) go to `output[pos..]`, the
+/// `pos` bytes before being the window. The position after the block.
 #[allow(clippy::too_many_arguments)]
 fn execute(
     stream: &[u8],
@@ -617,7 +775,8 @@ fn execute(
     output: &mut [u8],
     start: usize,
     max_block_len: usize,
-) -> Result<usize, DirectError> {
+    history: &History<'_>,
+) -> Result<usize, BlockError> {
     let mut bits = BackBits::new(stream)
         .ok_or_else(|| block_error(DecodeSequenceError::ExtraPadding { skipped_bits: 9 }))?;
     // At least 56 bits are ready: the three states take at most 26.
@@ -627,14 +786,14 @@ fn execute(
 
     // A block decodes to no more than `max_block_len` bytes, within the output.
     let end = output.len().min(start + max_block_len);
-    let too_long = |pos: usize| -> DirectError {
+    let too_long = |pos: usize| -> BlockError {
         if pos > start + max_block_len {
             block_error(ExecuteSequencesError::TooManyBytesGenerated {
                 max: max_block_len,
                 decoded: pos - start,
             })
         } else {
-            FrameDecoderError::TargetTooSmall.into()
+            BlockError::TargetTooSmall
         }
     };
     let mut hist = *offset_hist;
@@ -679,7 +838,7 @@ fn execute(
                     hist[0]
                 }
                 _ => {
-                    let offset = hist[0].wrapping_sub(1);
+                    let offset = hist[0].saturating_sub(1);
                     hist = [offset, hist[0], hist[1]];
                     offset
                 }
@@ -703,14 +862,6 @@ fn execute(
         if offset == 0 {
             return Err(block_error(ExecuteSequencesError::ZeroOffset));
         }
-        if offset > match_start {
-            return Err(block_error(ExecuteSequencesError::DecodebufferError(
-                crate::decoding::errors::DecodeBufferError::OffsetTooBig {
-                    offset,
-                    buf_len: match_start,
-                },
-            )));
-        }
 
         // Literals: sixteen bytes at once when they fit (most do), whatever the length.
         if lit_len <= 16 && literals_pos + 16 <= literals.len() && pos + 16 <= output.len() {
@@ -722,6 +873,15 @@ fn execute(
             output[pos..match_start].copy_from_slice(&literals[literals_pos..literals_end]);
         }
         literals_pos = literals_end;
+
+        // A match that starts before the output: only with a dictionary or a window in two
+        // pieces, otherwise an error.
+        if offset > match_start {
+            copy_from_history(output, match_start, match_len, offset, history)
+                .map_err(block_error)?;
+            pos = match_end;
+            continue;
+        }
 
         // The match, which may overlap what it writes. Most matches are short: sixteen bytes at
         // once from sixteen bytes back or more, eight at a time from eight back or more (each
