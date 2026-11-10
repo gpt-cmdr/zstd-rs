@@ -843,6 +843,8 @@ pub mod direct;
 #[cfg(feature = "std")]
 pub mod encode_corpus;
 pub mod fuzz_regressions;
+#[cfg(feature = "std")]
+pub mod streaming;
 
 #[cfg(feature = "std")]
 #[test]

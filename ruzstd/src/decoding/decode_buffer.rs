@@ -1,19 +1,195 @@
+//! The window of the streaming decoder: the decoded bytes that were not collected yet, of which
+//! the last `window_size` are kept for the matches of the blocks to come.
+//!
+//! Blocks are decoded straight into the buffer ([`DecodeBuffer::block_target`]), so the bytes of
+//! the window have to lie in one piece wherever possible. The buffer is therefore not a ring that
+//! wraps at any byte: a block is always written in one piece, and when there is no room for one
+//! after the newest bytes, the next block starts over at the front of the buffer, in the space
+//! that collecting has freed. The window is then in two pieces, the older one ending where the
+//! last block before the turn ended, until the older piece is collected. The reference decoder's
+//! streaming mode keeps its window the same way.
+//!
+//! A reader that asks for all of a frame at once ([`DecodeBuffer::lend`]) gets it decoded
+//! straight into its vector, which is the buffer for that time.
+//!
+//! All of this is safe code over a zeroed `Vec<u8>`.
+
 use crate::io::{Error, Read, Write};
+use alloc::vec;
 use alloc::vec::Vec;
+use core::convert::TryFrom;
 #[cfg(feature = "hash")]
 use core::hash::Hasher;
 
-use super::ringbuffer::RingBuffer;
-use crate::decoding::errors::DecodeBufferError;
+use super::direct::History;
+use crate::common::MAX_BLOCK_SIZE;
+
+/// The bytes after those of a block that decoding it may write to: see
+/// [`BlockScratch::decode_block`](super::direct::BlockScratch::decode_block).
+const SLACK: usize = 32;
+
+/// The largest size the buffer starts with for a frame that states the size of its content.
+const FIRST_SIZE_STATED: usize = 8 << 20;
+
+/// The bytes not yet collected, oldest first: `buf[head..tail]`, or when `turned`
+/// `buf[head..older_end]` and then `buf[..tail]`.
+///
+/// Invariants: `head <= tail <= buf.len()` when not `turned`; `tail <= head < older_end <=
+/// buf.len()` when `turned`. Every byte of `buf` is initialized, those outside the ranges above
+/// with whatever was there before.
+struct Window {
+    buf: Vec<u8>,
+    head: usize,
+    tail: usize,
+    older_end: usize,
+    turned: bool,
+    /// The buffer is the vector of a reader, whose bytes before `head` are not the decoder's:
+    /// it only grows at its end and never turns.
+    lent: bool,
+    /// Where the frame ends in a lent buffer, if its header states its size.
+    lent_end: usize,
+    /// The bytes of a lent buffer before this are in the checksum.
+    lent_hashed: usize,
+}
+
+impl Window {
+    fn len(&self) -> usize {
+        if self.turned {
+            self.older_end - self.head + self.tail
+        } else {
+            self.tail - self.head
+        }
+    }
+
+    fn clear(&mut self) {
+        self.head = 0;
+        self.tail = 0;
+        self.older_end = 0;
+        self.turned = false;
+    }
+
+    fn as_slices(&self) -> (&[u8], &[u8]) {
+        if self.turned {
+            (&self.buf[self.head..self.older_end], &self.buf[..self.tail])
+        } else {
+            (&self.buf[self.head..self.tail], &[])
+        }
+    }
+
+    /// Forgets the `n` oldest bytes (`n` is at most `len()`).
+    fn drop_first_n(&mut self, n: usize) {
+        debug_assert!(n <= self.len());
+        if self.turned {
+            let older = self.older_end - self.head;
+            if n < older {
+                self.head += n;
+            } else {
+                self.turned = false;
+                self.older_end = 0;
+                self.head = n - older;
+            }
+        } else {
+            self.head += n;
+        }
+        if !self.turned && self.head == self.tail {
+            self.head = 0;
+            self.tail = 0;
+        }
+    }
+
+    /// Makes `need` bytes writable at the end of a lent buffer, or fewer when the frame states
+    /// that it ends before (`exact` asks for all of them).
+    ///
+    /// The vector is not made larger than the frame states it has to be: a reader that gave it
+    /// that capacity keeps its allocation. A compressed block that then decodes to more than
+    /// the frame states is left is an error. Past the stated size the vector grows as for a
+    /// frame that states none.
+    fn make_room_lent(&mut self, need: usize, exact: bool) {
+        let want = self.tail + need;
+        let new_len = if exact || want <= self.buf.capacity() || self.tail >= self.lent_end {
+            want
+        } else {
+            want.min(self.lent_end)
+        };
+        // Zeroed block by block, so that no more is touched than is decoded
+        if new_len > self.buf.len() {
+            self.buf.resize(new_len, 0);
+        }
+    }
+
+    /// Makes `room` bytes writable at `tail`, in one piece.
+    ///
+    /// A buffer that is too small is replaced by one of twice the size: of `first` bytes to
+    /// begin with, of no more than `goal` bytes unless the bytes not yet collected take more.
+    fn make_room(&mut self, room: usize, goal: usize, first: usize) {
+        debug_assert!(!self.lent);
+        let len = self.len();
+        let size = self.buf.len();
+        if self.turned {
+            if self.head - self.tail >= room {
+                return;
+            }
+        } else {
+            if size - self.tail >= room {
+                return;
+            }
+            if self.head >= room {
+                // Start over at the front, in what was collected
+                self.older_end = self.tail;
+                self.tail = 0;
+                self.turned = true;
+                return;
+            }
+            if size >= goal && size - len >= room {
+                // Less than a block was collected, by a reader that then fell behind. (A
+                // buffer below its goal grows instead: it would be moved again and again.)
+                self.buf.copy_within(self.head..self.tail, 0);
+                self.head = 0;
+                self.tail = len;
+                return;
+            }
+        }
+        // Collecting did not keep up, or the buffer is not yet as large as it gets: a larger
+        // one, with the bytes in one piece at its front. It is zeroed by the allocator, which
+        // for a large one need not touch the memory.
+        let grown = if size == 0 {
+            first
+        } else if size < goal {
+            size.saturating_mul(2).min(goal)
+        } else {
+            size.saturating_mul(2)
+        };
+        let mut buf = vec![0; grown.max(len + room)];
+        let (older, newer) = self.as_slices();
+        buf[..older.len()].copy_from_slice(older);
+        buf[older.len()..len].copy_from_slice(newer);
+        self.buf = buf;
+        self.clear();
+        self.tail = len;
+    }
+}
 
 pub struct DecodeBuffer {
-    buffer: RingBuffer,
+    window: Window,
     pub dict_content: Vec<u8>,
 
     pub window_size: usize,
+    /// The size of the content of the frame, if its header states it.
+    content_size: Option<usize>,
     total_output_counter: u64,
     #[cfg(feature = "hash")]
     pub hash: twox_hash::XxHash64,
+}
+
+/// Where the next block of a frame is decoded to.
+pub(crate) struct BlockTarget<'a> {
+    /// The block goes to `output[pos..]`, which has room for a block of the largest size and
+    /// [`SLACK`] bytes (in a lent buffer, at least for what the frame states is left of it).
+    /// The bytes before `pos` are the newest of the window.
+    pub(crate) output: &'a mut [u8],
+    pub(crate) pos: usize,
+    /// What precedes `output`.
+    pub(crate) history: History<'a>,
 }
 
 impl Read for DecodeBuffer {
@@ -34,19 +210,31 @@ impl Read for DecodeBuffer {
 impl DecodeBuffer {
     pub fn new(window_size: usize) -> DecodeBuffer {
         DecodeBuffer {
-            buffer: RingBuffer::new(),
+            window: Window {
+                buf: Vec::new(),
+                head: 0,
+                tail: 0,
+                older_end: 0,
+                turned: false,
+                lent: false,
+                lent_end: usize::MAX,
+                lent_hashed: 0,
+            },
             dict_content: Vec::new(),
             window_size,
+            content_size: None,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
         }
     }
 
-    pub fn reset(&mut self, window_size: usize) {
+    /// Empties the buffer for a frame of this window size. `content_size` is the size of its
+    /// content if the frame header states one: no more than that and a block is allocated.
+    pub fn reset(&mut self, window_size: usize, content_size: Option<u64>) {
         self.window_size = window_size;
-        self.buffer.clear();
-        self.buffer.reserve(self.window_size);
+        self.content_size = content_size.map(|size| usize::try_from(size).unwrap_or(usize::MAX));
+        self.window.clear();
         self.dict_content.clear();
         self.total_output_counter = 0;
         #[cfg(feature = "hash")]
@@ -56,132 +244,184 @@ impl DecodeBuffer {
     }
 
     pub fn len(&self) -> usize {
-        self.buffer.len()
+        self.window.len()
     }
 
+    /// Block_Maximum_Size (RFC 8878 3.1.1.2.4): the smaller of the window and 128 KiB.
+    pub fn max_block_len(&self) -> usize {
+        self.window_size.min(MAX_BLOCK_SIZE as usize)
+    }
+
+    /// Room at the end of the window, in one piece: for `exact` bytes, or for a block of the
+    /// largest size.
+    fn make_room(&mut self, exact: Option<usize>) {
+        let room = self.max_block_len() + SLACK;
+        if self.window.lent {
+            self.window
+                .make_room_lent(exact.unwrap_or(room), exact.is_some());
+            return;
+        }
+        // With the window and two blocks the buffer never has to grow or move for a reader that
+        // collects after every block: when a block does not fit at the end, more than a block
+        // was collected at the front. A frame of a known size needs no more than that size.
+        let goal = self
+            .window_size
+            .saturating_add(2 * room)
+            .min(self.content_size.unwrap_or(usize::MAX).saturating_add(room));
+        // A header may claim any window and size, and a stream of a few bytes may come with a
+        // window of megabytes: the buffer starts smaller than that and grows as bytes arrive
+        let first = goal.min(if self.content_size.is_some() {
+            FIRST_SIZE_STATED
+        } else {
+            2 * room
+        });
+        self.window.make_room(room, goal, first);
+    }
+
+    /// Where to decode the next block. [`DecodeBuffer::commit`] adds what was decoded.
+    pub(crate) fn block_target(&mut self) -> BlockTarget<'_> {
+        self.target(None)
+    }
+
+    /// Where the next bytes go: `exact` of them, or a block.
+    fn target(&mut self, exact: Option<usize>) -> BlockTarget<'_> {
+        self.make_room(exact);
+        let window = &mut self.window;
+        let (low, high) = window.buf.split_at_mut(window.head);
+        let (output, pos, older): (&mut [u8], usize, &[u8]) = if window.turned {
+            (low, window.tail, &high[..window.older_end - window.head])
+        } else {
+            (high, window.tail - window.head, &[])
+        };
+        // A frame may refer to its dictionary until it has decoded more than its window size
+        let window_size = self.window_size as u64;
+        let dict_end = if self.total_output_counter <= window_size {
+            let left = usize::try_from(window_size - self.total_output_counter);
+            pos.saturating_add(left.unwrap_or(usize::MAX))
+                .saturating_add(1)
+        } else {
+            0
+        };
+        BlockTarget {
+            output,
+            pos,
+            history: History {
+                window: older,
+                dict: &self.dict_content,
+                dict_end,
+            },
+        }
+    }
+
+    /// Makes `output` the buffer, to decode the frame after the bytes it holds: only when the
+    /// buffer is empty. Returns the buffer's own allocation, for [`DecodeBuffer::take_back`].
+    pub(crate) fn lend(&mut self, output: &mut Vec<u8>) -> Vec<u8> {
+        debug_assert_eq!(self.window.len(), 0);
+        if let Some(content_size) = self.content_size {
+            // A header may state any size: only what a window or so takes is reserved at once
+            let at_once = content_size.min(self.window_size.max(1 << 20));
+            output.reserve(at_once);
+        }
+        let own = core::mem::replace(&mut self.window.buf, core::mem::take(output));
+        self.window.clear();
+        self.window.lent_end = self.content_size.map_or(usize::MAX, |size| {
+            self.window.buf.len().saturating_add(size)
+        });
+        self.window.head = self.window.buf.len();
+        self.window.tail = self.window.buf.len();
+        self.window.lent_hashed = self.window.buf.len();
+        self.window.lent = true;
+        own
+    }
+
+    /// Adds what was decoded into the lent buffer to the checksum: after each block, while its
+    /// bytes are in the cache.
+    pub(crate) fn hash_lent(&mut self) {
+        #[cfg(feature = "hash")]
+        self.hash
+            .write(&self.window.buf[self.window.lent_hashed..self.window.tail]);
+        self.window.lent_hashed = self.window.tail;
+    }
+
+    /// Returns the vector of [`DecodeBuffer::lend`] to `output`, with what was decoded since.
+    /// The bytes count as collected: they are in the checksum and no longer in the buffer.
+    pub(crate) fn take_back(&mut self, own: Vec<u8>, output: &mut Vec<u8>) {
+        self.hash_lent();
+        self.window.buf.truncate(self.window.tail);
+        *output = core::mem::replace(&mut self.window.buf, own);
+        self.window.clear();
+        self.window.lent = false;
+    }
+
+    /// Adds the `len` bytes decoded to the [`DecodeBuffer::block_target`] to the window.
+    pub(crate) fn commit(&mut self, len: usize) {
+        self.window.tail += len;
+        self.total_output_counter += len as u64;
+    }
+
+    /// Adds `fill_length` (at most a block) times `fill_with`. As before the window was decoded
+    /// into, the bytes of blocks that are not compressed do not count towards the size after
+    /// which the dictionary is out of reach.
     pub fn extend_and_fill(&mut self, fill_with: u8, fill_length: usize) {
-        self.buffer.extend_and_fill(fill_with, fill_length);
+        let target = self.target(Some(fill_length));
+        target.output[target.pos..target.pos + fill_length].fill(fill_with);
+        self.window.tail += fill_length;
     }
 
+    /// Adds `fill_length` bytes (at most a block) of `read`, or nothing when it has fewer.
     pub fn extend_from_reader<R: Read>(
         &mut self,
-        read: R,
+        mut read: R,
         fill_length: usize,
     ) -> Result<(), crate::io::Error> {
-        self.buffer.extend_from_reader(read, fill_length)
+        let target = self.target(Some(fill_length));
+        read.read_exact(&mut target.output[target.pos..target.pos + fill_length])?;
+        self.window.tail += fill_length;
+        Ok(())
     }
 
+    /// Adds `data` (at most a block).
+    #[cfg(test)]
     pub fn push(&mut self, data: &[u8]) {
-        self.buffer.extend(data);
-        self.total_output_counter += data.len() as u64;
+        let target = self.target(Some(data.len()));
+        target.output[target.pos..target.pos + data.len()].copy_from_slice(data);
+        self.commit(data.len());
     }
 
-    pub fn repeat(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
-        if offset > self.buffer.len() {
-            self.repeat_from_dict(offset, match_length)
-        } else {
-            let buf_len = self.buffer.len();
-            let start_idx = buf_len - offset;
-            let end_idx = start_idx + match_length;
-
-            self.buffer.reserve(match_length);
-            if end_idx > buf_len {
-                // We need to copy in chunks.
-                self.repeat_in_chunks(offset, match_length, start_idx);
-            } else {
-                // can just copy parts of the existing buffer
-                // SAFETY: Requirements checked:
-                // 1. start_idx + match_length must be <= self.buffer.len()
-                //      We know that:
-                //      1. start_idx = self.buffer.len() - offset
-                //      2. end_idx = start_idx + match_length
-                //      3. end_idx <= self.buffer.len()
-                //      Thus follows: start_idx + match_length <= self.buffer.len()
-                //
-                // 2. explicitly reserved enough memory for the whole match_length
-                unsafe {
-                    self.buffer
-                        .extend_from_within_unchecked(start_idx, match_length)
-                };
-            }
-
-            self.total_output_counter += match_length as u64;
-            Ok(())
-        }
-    }
-
-    fn repeat_in_chunks(&mut self, offset: usize, match_length: usize, start_idx: usize) {
-        // We have at max offset bytes in one chunk, the last one can be smaller
-        let mut start_idx = start_idx;
-        let mut copied_counter_left = match_length;
-        // TODO this can  be optimized further I think.
-        // Each time we copy a chunk we have a repetiton of length 'offset', so we can copy offset * iteration many bytes from start_idx
-        while copied_counter_left > 0 {
-            let chunksize = usize::min(offset, copied_counter_left);
-
-            // SAFETY: Requirements checked:
-            // 1. start_idx + chunksize must be <= self.buffer.len()
-            //      We know that:
-            //      1. start_idx starts at buffer.len() - offset
-            //      2. chunksize <= offset (== offset for each iteration but the last, and match_length modulo offset in the last iteration)
-            //      3. the buffer grows by offset many bytes each iteration but the last
-            //      4. start_idx is increased by the same amount as the buffer grows each iteration
-            //
-            //      Thus follows: start_idx + chunksize == self.buffer.len() in each iteration but the last, where match_length modulo offset == chunksize < offset
-            //          Meaning: start_idx + chunksize <= self.buffer.len()
-            //
-            // 2. explicitly reserved enough memory for the whole match_length
-            unsafe {
-                self.buffer
-                    .extend_from_within_unchecked(start_idx, chunksize)
-            };
-            copied_counter_left -= chunksize;
-            start_idx += chunksize;
-        }
-    }
-
-    #[cold]
-    fn repeat_from_dict(
+    /// Adds the `match_length` bytes (at most a block) that start `offset` bytes back.
+    #[cfg(test)]
+    pub fn repeat(
         &mut self,
         offset: usize,
         match_length: usize,
-    ) -> Result<(), DecodeBufferError> {
-        if self.total_output_counter <= self.window_size as u64 {
-            // at least part of that repeat is from the dictionary content
-            let bytes_from_dict = offset - self.buffer.len();
-
-            if bytes_from_dict > self.dict_content.len() {
-                return Err(DecodeBufferError::NotEnoughBytesInDictionary {
-                    got: self.dict_content.len(),
-                    need: bytes_from_dict,
-                });
+    ) -> Result<(), crate::decoding::errors::DecodeBufferError> {
+        use crate::decoding::errors::ExecuteSequencesError;
+        let target = self.target(Some(match_length));
+        if offset <= target.pos {
+            for at in target.pos..target.pos + match_length {
+                target.output[at] = target.output[at - offset];
             }
-
-            if bytes_from_dict < match_length {
-                let dict_slice = &self.dict_content[self.dict_content.len() - bytes_from_dict..];
-                self.buffer.extend(dict_slice);
-
-                self.total_output_counter += bytes_from_dict as u64;
-                return self.repeat(self.buffer.len(), match_length - bytes_from_dict);
-            } else {
-                let low = self.dict_content.len() - bytes_from_dict;
-                let high = low + match_length;
-                let dict_slice = &self.dict_content[low..high];
-                self.buffer.extend(dict_slice);
-            }
-            Ok(())
         } else {
-            Err(DecodeBufferError::OffsetTooBig {
+            super::direct::copy_from_history(
+                target.output,
+                target.pos,
+                match_length,
                 offset,
-                buf_len: self.buffer.len(),
-            })
+                &target.history,
+            )
+            .map_err(|e| match e {
+                ExecuteSequencesError::DecodebufferError(e) => e,
+                other => panic!("{:?}", other),
+            })?;
         }
+        self.commit(match_length);
+        Ok(())
     }
 
     /// Check if and how many bytes can currently be drawn from the buffer
     pub fn can_drain_to_window_size(&self) -> Option<usize> {
-        if self.buffer.len() > self.window_size {
-            Some(self.buffer.len() - self.window_size)
+        if self.window.len() > self.window_size {
+            Some(self.window.len() - self.window_size)
         } else {
             None
         }
@@ -189,7 +429,7 @@ impl DecodeBuffer {
 
     //How many bytes can be drained if the window_size does not have to be maintained
     pub fn can_drain(&self) -> usize {
-        self.buffer.len()
+        self.window.len()
     }
 
     /// Drain as much as possible while retaining enough so that decoding si still possible with the required window_size
@@ -219,7 +459,7 @@ impl DecodeBuffer {
 
     /// drain the buffer completely
     pub fn drain(&mut self) -> Vec<u8> {
-        let (slice1, slice2) = self.buffer.as_slices();
+        let (slice1, slice2) = self.window.as_slices();
         #[cfg(feature = "hash")]
         {
             self.hash.write(slice1);
@@ -229,17 +469,17 @@ impl DecodeBuffer {
         let mut vec = Vec::with_capacity(slice1.len() + slice2.len());
         vec.extend_from_slice(slice1);
         vec.extend_from_slice(slice2);
-        self.buffer.clear();
+        self.window.clear();
         vec
     }
 
     pub fn drain_to_writer(&mut self, mut sink: impl Write) -> Result<usize, Error> {
-        let write_limit = self.buffer.len();
+        let write_limit = self.window.len();
         self.drain_to(write_limit, |buf| write_all_bytes(&mut sink, buf))
     }
 
     pub fn read_all(&mut self, target: &mut [u8]) -> Result<usize, Error> {
-        let amount = self.buffer.len().min(target.len());
+        let amount = self.window.len().min(target.len());
 
         let mut written = 0;
         self.drain_to(amount, |buf| {
@@ -263,24 +503,24 @@ impl DecodeBuffer {
         }
 
         struct DrainGuard<'a> {
-            buffer: &'a mut RingBuffer,
+            window: &'a mut Window,
             amount: usize,
         }
 
         impl Drop for DrainGuard<'_> {
             fn drop(&mut self) {
                 if self.amount != 0 {
-                    self.buffer.drop_first_n(self.amount);
+                    self.window.drop_first_n(self.amount);
                 }
             }
         }
 
         let mut drain_guard = DrainGuard {
-            buffer: &mut self.buffer,
+            window: &mut self.window,
             amount: 0,
         };
 
-        let (slice1, slice2) = drain_guard.buffer.as_slices();
+        let (slice1, slice2) = drain_guard.window.as_slices();
         let n1 = slice1.len().min(amount);
         let n2 = slice2.len().min(amount - n1);
 
@@ -330,7 +570,8 @@ fn write_all_bytes(mut sink: impl Write, buf: &[u8]) -> (usize, Result<(), Error
 #[cfg(test)]
 mod tests {
     use super::DecodeBuffer;
-    use crate::io::{Error, ErrorKind, Write};
+    use crate::decoding::errors::DecodeBufferError;
+    use crate::io::{Error, ErrorKind, Read, Write};
 
     extern crate std;
     use alloc::vec;
@@ -381,6 +622,9 @@ mod tests {
         assert_eq!(short_writer.buf.len(), repeats * 50);
         decode_buf.drain_to_writer(&mut short_writer).unwrap();
         assert_eq!(short_writer.buf.len(), repeats * 50 + 100);
+        for (at, byte) in short_writer.buf.iter().enumerate() {
+            assert_eq!(*byte, b'0' + (at % 10) as u8);
+        }
     }
 
     #[test]
@@ -459,5 +703,114 @@ mod tests {
             }
         }
         assert_eq!(short_writer.buf.len(), repeats * 50 + 100);
+    }
+
+    /// A generator of reproducible numbers.
+    struct Lcg(u64);
+    impl Lcg {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) as usize % n
+        }
+    }
+
+    /// Literals, matches and reads in a random order against a plain vector, with readers that
+    /// collect after every step (the window turns around) and ones that fall behind (it grows).
+    #[test]
+    fn behaves_as_a_vector_of_all_bytes() {
+        for &(window_size, eager, seed) in &[
+            (64usize, true, 1u64),
+            (64, false, 2),
+            (1000, true, 3),
+            (1000, false, 4),
+            (5000, true, 5),
+            (200_000, true, 6),
+        ] {
+            let mut rng = Lcg(seed);
+            let mut buffer = DecodeBuffer::new(1);
+            buffer.reset(window_size, None);
+            let max = buffer.max_block_len();
+            // Everything decoded, and how much of it was collected
+            let mut all: Vec<u8> = Vec::new();
+            let mut collected: Vec<u8> = Vec::new();
+            let mut turns = 0;
+            let steps = if window_size > 100_000 { 400 } else { 4000 };
+            for step in 0..steps {
+                let longest = if rng.below(4) == 0 { max } else { max.min(40) };
+                let n = 1 + rng.below(longest);
+                let available = all.len() - collected.len();
+                if rng.below(3) == 0 || available == 0 {
+                    let data: Vec<u8> = (0..n).map(|i| (step * 7 + i * 13) as u8).collect();
+                    buffer.push(&data);
+                    all.extend_from_slice(&data);
+                } else {
+                    // Sometimes further back than there are bytes
+                    let offset = 1 + rng.below(available + available / 8 + 1);
+                    let result = buffer.repeat(offset, n);
+                    if offset > available {
+                        assert!(result.is_err(), "offset {} of {}", offset, available);
+                    } else {
+                        result.unwrap();
+                        for _ in 0..n {
+                            all.push(all[all.len() - offset]);
+                        }
+                    }
+                }
+                turns += usize::from(buffer.window.turned);
+                assert_eq!(buffer.len(), all.len() - collected.len());
+                if eager || rng.below(20) == 0 {
+                    let mut out = vec![0; 1 + rng.below(3 * max)];
+                    loop {
+                        let n = buffer.read(&mut out).unwrap();
+                        collected.extend_from_slice(&out[..n]);
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    assert!(buffer.len() <= window_size);
+                }
+            }
+            if eager {
+                assert!(turns > 0, "window {}", window_size);
+                // The window and two blocks, with what a block may write past its end
+                assert!(buffer.window.buf.len() <= window_size + 2 * (max + 32));
+            }
+            collected.extend_from_slice(&buffer.drain());
+            assert!(collected == all, "window {} eager {}", window_size, eager);
+            assert_eq!(buffer.len(), 0);
+        }
+    }
+
+    /// Matches reach the dictionary until more than the window size was decoded, also from a
+    /// window in two pieces, and run on from the dictionary into the window.
+    #[test]
+    fn matches_from_the_dictionary() {
+        let mut buffer = DecodeBuffer::new(1);
+        buffer.reset(100, None);
+        buffer.dict_content.extend_from_slice(b"abcdefgh");
+        // Nothing decoded: all of the match is in the dictionary, then it runs on
+        buffer.repeat(3, 2).unwrap();
+        buffer.repeat(8 + 2, 12).unwrap();
+        assert!(matches!(
+            buffer.repeat(8 + 14 + 1, 1),
+            Err(DecodeBufferError::NotEnoughBytesInDictionary { got: 8, need: 9 })
+        ));
+        buffer.push(&[b'-'; 86]);
+        // 100 bytes decoded: the dictionary is still there
+        buffer.repeat(108, 1).unwrap();
+        // 101 bytes: no more
+        assert!(matches!(
+            buffer.repeat(109, 1),
+            Err(DecodeBufferError::OffsetTooBig {
+                offset: 109,
+                buf_len: 101
+            })
+        ));
+        let all = buffer.drain();
+        assert_eq!(&all[..14], b"fgabcdefghfgab");
+        assert_eq!(all[100], b'a');
     }
 }

@@ -15,8 +15,28 @@ chunk, on an x86-64 desktop. `cargo run --release --example rasterbench` reprodu
   bitstream is refilled at most twice per sequence. The bytes of the output after those of the frames may be
   written to.
 * Huffman-coded literals are decoded four streams side by side through an 11-bit table, five lookups per refill,
-  and two symbols per lookup where the literals compress well. The streaming decoder uses the same decoding (it
-  still takes 1.5 to 4.6 times as long as the C library, for its window buffer)
+  and two symbols per lookup where the literals compress well
+* The streaming decoder (`StreamingDecoder`, `FrameDecoder::decode_blocks` and what collects from it, `decode_from_to`,
+  `decode_all` for frames with a dictionary) decodes blocks with the code of `decode_all`, straight into its window
+  buffer: no vector of sequences, no ring buffer. The window buffer is a zeroed `Vec<u8>` in which a block is always
+  in one piece; at its end the next block starts over at the front, and matches that reach the older piece or the
+  dictionary take a slower path. It starts small and grows to the window and two blocks, or to the size the frame
+  states. The ring buffer and its `unsafe` code are gone: the decoder has no `unsafe` left.
+  Measured as above (four runs alternating with the previous code, on a machine with other work running, so single
+  figures move by a third): a `StreamingDecoder` read in pieces through `Read::take` into an empty vector took 1.6 to
+  5.0 times as long as `zstd::bulk::decompress` (median of the runs per file and level; 3.25 times over all) and
+  now takes 1.3 to 3.3 times as long (1.8 over all). The stream decoder of the C library read the same way takes
+  1.2 to 2.5 times as long (1.55 over all): most of what is left is the memory of a decoder made for each frame
+  and of a vector that grows, not decoding. With the `FrameDecoder` kept between frames
+  (`StreamingDecoder::new_with_decoder`) and a vector of the right capacity, reading in pieces takes 1.0 to 1.45
+  times as long. `decode_all` is unchanged (1.10 times over all before and after)
+* `StreamingDecoder::read_to_end` decodes a frame that was not read from yet straight into the vector, which is
+  then its own window: 0.95 to 1.5 times as long as `zstd::bulk::decompress` (1.25 over all). A vector that has
+  the capacity for a frame that states its size is not reallocated. Read this way, a frame whose content is
+  larger than its header states may be an error (the C library rejects such frames; read in pieces they decode
+  as before), and a match may reach further back than the window, as in `decode_all`
+* `rasterbench` also times the stream decoder of the C library and `read_to_end`, and `STREAM_ONLY=<seconds>` loops
+  the streaming decoder for profiling
 * `decode_all` with the `hash` feature compares the checksum a frame ends with to that of the content decoded:
   `FrameDecoderError::ChecksumMismatch` when they differ. The streaming decoder reports both and leaves the
   comparison to the caller, as before
