@@ -38,18 +38,34 @@ jobs:
             variant: C library without assembly
             artifact: -no-asm
             cflags: -DZSTD_DISABLE_ASM
+          # With GCC and Clang on x86-64 the C library also compiles its decoding loops for BMI2 and picks
+          # them when the processor has it; the crate is compiled for the baseline x86-64 only. This job
+          # compiles the crate for x86-64-v3 (BMI2, AVX2) to tell what that is worth.
+          - os: ubuntu-latest
+            variant: crate compiled for x86-64-v3
+            artifact: -v3
+            rustflags: -C target-cpu=x86-64-v3
+          # The C library compiled by GCC (MinGW-w64) instead of MSVC, on the same system
+          - os: windows-latest
+            variant: GNU toolchain
+            artifact: -gnu
+            target: x86_64-pc-windows-gnu
     defaults:
       run:
         shell: bash
     env:
       RUNS: ${{ inputs.runs || '7' }}
       CFLAGS: ${{ matrix.cflags }}
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Install Python
         uses: actions/setup-python@v5
@@ -71,18 +87,21 @@ jobs:
             echo
             echo "- CPU: $(echo "$cpu" | tr -d '\r') ($cores logical cores, $RUNNER_ARCH)"
             echo "- Image: $ImageOS $ImageVersion"
-            echo "- Compiler: $(rustc --version), host $(rustc -vV | sed -n 's/^host: //p')"
+            echo "- Compiler: $(rustc --version), target ${CARGO_BUILD_TARGET:-$(rustc -vV | sed -n 's/^host: //p')}, RUSTFLAGS \"$RUSTFLAGS\""
             echo "- Timed runs: $RUNS (the best counts; level 19 runs once)"
           } | tee machine.md
           if [ "$RUNNER_OS" = Linux ]; then lscpu; fi
 
       - name: Build the example
         run: |
+          if [ -z "$CARGO_BUILD_TARGET" ]; then unset CARGO_BUILD_TARGET; fi
           cargo build --release --example rasterbench
+          mkdir -p bench-data
+          cp target/$CARGO_BUILD_TARGET/release/examples/rasterbench${{ runner.os == 'Windows' && '.exe' || '' }} bench-data/
           tree=$(cargo tree -p zstd-rust --prefix none)
           echo "- C library: $(grep '^zstd-sys' <<< "$tree" | sort -u), CFLAGS \"$CFLAGS\"" | tee -a machine.md
           if [ "$RUNNER_OS" != Windows ]; then
-            echo "- Symbols of the C library's Huffman assembly in the binary: $(nm target/release/examples/rasterbench | grep -c fast_asm_loop || true)" | tee -a machine.md
+            echo "- Symbols of the C library's Huffman assembly in the binary: $(nm bench-data/rasterbench | grep -c fast_asm_loop || true)" | tee -a machine.md
           fi
 
       - name: Download the rasters and cut them into chunks
@@ -92,7 +111,7 @@ jobs:
 
       - name: Run
         run: |
-          ./target/release/examples/rasterbench bench-data/chunks | tee rasterbench.txt
+          ./bench-data/rasterbench bench-data/chunks | tee rasterbench.txt
 
       - name: Summary
         if: always()
