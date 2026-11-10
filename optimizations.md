@@ -25,6 +25,10 @@ The decode buffer must be able to do two things efficiently
 
 The stdlibs VecDequeu and Vec can each do one but not the other efficiently. So a custom implementation of a ringbuffer was written.
 
+(Replaced since: blocks are now decoded straight into a zeroed `Vec<u8>` that keeps the window in one piece, or in
+two after it turns around at the end of the buffer. See `ruzstd/src/decoding/decode_buffer.rs`. The decoder has no
+`unsafe` code left.)
+
 ## Introducing NO additional unsafe code
 These are just nice to have
 

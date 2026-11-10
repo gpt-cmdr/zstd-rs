@@ -9,6 +9,13 @@
 //! the same buffer, with one decoder of the C library, instead of into a new buffer each (and a new decoder of
 //! the C library each): allocating the output costs both libraries the same, more on some systems than on
 //! others, which hides a part of the difference between them.
+//! `DECODE_ONLY=<seconds>` and `STREAM_ONLY=<seconds>` first loop `decode_all` or the streaming decoder (read
+//! in pieces) for that long, to profile them.
+//!
+//! Decoding is timed four ways, each as the time of `zstd::bulk::decompress` times x: "rust stream" and "C
+//! stream" read the stream decoder of either library in pieces, through `Read::take`; "to end" is
+//! `StreamingDecoder::read_to_end` itself, which decodes straight into the vector; "rust all" is
+//! `FrameDecoder::decode_all`.
 use std::io::Read;
 use std::time::Instant;
 use zstd_rust::decoding::{FrameDecoder, StreamingDecoder};
@@ -167,6 +174,66 @@ fn main() {
                         })
                         .sum::<usize>()
                 });
+                if let Ok(seconds) = std::env::var("STREAM_ONLY") {
+                    // For profiling: only the streaming decoder, for that many seconds
+                    let until = Instant::now()
+                        + std::time::Duration::from_secs_f64(seconds.parse().unwrap());
+                    while Instant::now() < until {
+                        for f in &c {
+                            let mut out = Vec::new();
+                            let mut src = &f[..];
+                            StreamingDecoder::new(&mut src)
+                                .unwrap()
+                                .take(len as u64)
+                                .read_to_end(&mut out)
+                                .unwrap();
+                        }
+                    }
+                }
+                let (dcs, _) = best(runs, || {
+                    c.iter()
+                        .map(|f| {
+                            let mut out = if reuse_out {
+                                shared.clear();
+                                core::mem::take(&mut shared)
+                            } else {
+                                Vec::new()
+                            };
+                            zstd::stream::read::Decoder::new(&f[..])
+                                .unwrap()
+                                .take(len as u64)
+                                .read_to_end(&mut out)
+                                .unwrap();
+                            assert_eq!(out.len(), len);
+                            if reuse_out {
+                                shared = out;
+                            }
+                            len
+                        })
+                        .sum::<usize>()
+                });
+                let (de, _) = best(runs, || {
+                    c.iter()
+                        .map(|f| {
+                            let mut out = if reuse_out {
+                                shared.clear();
+                                core::mem::take(&mut shared)
+                            } else {
+                                Vec::new()
+                            };
+                            let mut src = &f[..];
+                            StreamingDecoder::new(&mut src)
+                                .unwrap()
+                                .read_to_end(&mut out)
+                                .unwrap();
+                            assert_eq!(out.len(), len);
+                            if reuse_out {
+                                shared = out;
+                            }
+                            len
+                        })
+                        .sum::<usize>()
+                });
                 let (ds, _) = best(runs, || {
                     c.iter()
                         .map(|f| {
@@ -222,12 +289,16 @@ fn main() {
                     assert_eq!(&out[..], *b);
                 }
                 println!(
-                    "DEC {name:18} L{l:<2} C {:7.1} MB/s | rust stream {:7.1} (x{:.2}) | rust all {:7.1} (x{:.2})",
+                    "DEC {name:18} L{l:<2} C {:7.1} MB/s | rust stream {:7.1} (x{:.2}) | rust all {:7.1} (x{:.2}) | to end {:7.1} (x{:.2}) | C stream {:7.1} (x{:.2})",
                     mb / dc,
                     mb / ds,
                     ds / dc,
                     mb / da,
-                    da / dc
+                    da / dc,
+                    mb / de,
+                    de / dc,
+                    mb / dcs,
+                    dcs / dc
                 );
             }
         }

@@ -18,9 +18,9 @@ fn streamed(mut data: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// A generator of reproducible bytes.
-struct Lcg(u64);
+pub(super) struct Lcg(pub(super) u64);
 impl Lcg {
-    fn next(&mut self) -> u32 {
+    pub(super) fn next(&mut self) -> u32 {
         self.0 = self
             .0
             .wrapping_mul(6364136223846793005)
@@ -31,7 +31,7 @@ impl Lcg {
 
 /// Data of several kinds of redundancy: runs, repeats at short and long distances, text-like
 /// symbols and noise.
-fn sample(len: usize, seed: u64) -> Vec<u8> {
+pub(super) fn sample(len: usize, seed: u64) -> Vec<u8> {
     let mut rng = Lcg(seed);
     let mut out: Vec<u8> = Vec::with_capacity(len);
     while out.len() < len {
