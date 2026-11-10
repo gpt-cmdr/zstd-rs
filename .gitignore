@@ -8,3 +8,4 @@ fuzz_decodecorpus
 perf.data*
 ruzstd/fuzz/corpus
 .idea
+/bench-data

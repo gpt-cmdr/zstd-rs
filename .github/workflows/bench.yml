@@ -1,0 +1,112 @@
+name: Benchmark against the C library
+
+# Times the crate against the zstd C library on tiles of public rasters, on each kind of hosted runner.
+# Run it by hand (Actions, "Run workflow") or by pushing a branch named bench/* (the repository has a branch named ci, so ci/... names cannot exist). Shared runners are
+# noisy: compare the ratios to the C library, which ran on the same machine in the same job, and run it
+# more than once.
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: Timed runs of each measurement (the best counts)
+        default: "7"
+  push:
+    branches: ["bench/*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rasterbench:
+    name: rasterbench ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUNS: ${{ inputs.runs || '7' }}
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Machine
+        run: |
+          case "$RUNNER_OS" in
+            Linux) cpu=$(lscpu | sed -n 's/^Model name: *//p' | head -n 1)
+                   cores=$(nproc) ;;
+            macOS) cpu=$(sysctl -n machdep.cpu.brand_string)
+                   cores=$(sysctl -n hw.ncpu) ;;
+            Windows) cpu=$(powershell -NoProfile -Command "(Get-CimInstance Win32_Processor | Select-Object -First 1).Name")
+                     cores=$NUMBER_OF_PROCESSORS ;;
+          esac
+          {
+            echo "## rasterbench on ${{ matrix.os }}"
+            echo
+            echo "- CPU: $(echo "$cpu" | tr -d '\r') ($cores logical cores, $RUNNER_ARCH)"
+            echo "- Image: $ImageOS $ImageVersion"
+            echo "- Compiler: $(rustc --version), host $(rustc -vV | sed -n 's/^host: //p')"
+            echo "- Timed runs: $RUNS (the best counts; level 19 runs once)"
+          } | tee machine.md
+          if [ "$RUNNER_OS" = Linux ]; then lscpu; fi
+
+      - name: Build the example
+        run: |
+          cargo build --release --example rasterbench
+          tree=$(cargo tree -p zstd-rust --prefix none)
+          echo "- C library: $(grep '^zstd-sys' <<< "$tree" | sort -u)" | tee -a machine.md
+
+      - name: Download the rasters and cut them into chunks
+        run: |
+          python -m pip install --quiet numpy rasterio
+          python ruzstd/benches/raster_chunks.py --download bench-data/rasters bench-data/chunks | tee chunks.txt
+
+      - name: Run
+        run: |
+          ./target/release/examples/rasterbench bench-data/chunks | tee rasterbench.txt
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            cat machine.md
+            echo
+            python ruzstd/benches/rasterbench_table.py < rasterbench.txt
+            echo
+            echo "<details><summary>Output of the example</summary>"
+            echo
+            echo '```'
+            cat rasterbench.txt
+            echo '```'
+            echo
+            echo "</details>"
+          } > summary.md
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the tables
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rasterbench-${{ matrix.os }}
+          path: |
+            summary.md
+            machine.md
+            rasterbench.txt
+            chunks.txt
+          if-no-files-found: warn
