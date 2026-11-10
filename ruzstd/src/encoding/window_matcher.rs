@@ -54,6 +54,17 @@ const SLACK_BLOCKS: usize = 4;
 /// How many positions ahead the row of a position is fetched into the cache ([`Strategy::Lazy`] with rows)
 const ROW_LOOKAHEAD: usize = 8;
 
+/// With rows, positions that are not searched are not inserted either once the step between two searches is
+/// larger than this (`kLazySkippingStep` of the reference implementation)
+const LAZY_SKIPPING_STEP: usize = 8;
+
+/// With rows, of more than this many positions to insert at once only the first [`ROW_INSERT_AT_START`] and the
+/// last [`ROW_INSERT_AT_END`] are inserted (`kSkipThreshold`, `kMaxMatchStartPositionsToUpdate` and
+/// `kMaxMatchEndPositionsToUpdate` of the reference implementation)
+const ROW_SKIP_THRESHOLD: u32 = 384;
+const ROW_INSERT_AT_START: u32 = 96;
+const ROW_INSERT_AT_END: u32 = 32;
+
 /// The smallest hash table that is split into rows: 16 rows of 16 entries
 const MIN_ROW_HASH_LOG: u32 = 8;
 
@@ -1259,122 +1270,195 @@ impl WindowMatcher {
         // time: the rows are spread over tables larger than the caches of the processor, and waiting for a row at
         // every position costs more than everything else the search does.
         let mut hashes = [0u32; ROW_LOOKAHEAD];
-        {
-            let first = (next_to_update - base) as usize;
-            for pos in first..usize::min(first + ROW_LOOKAHEAD, ilimit + 1) {
-                hashes[pos % ROW_LOOKAHEAD] = hash_lazy(buf, pos, hash_bits) as u32;
-            }
-        }
+        fill_row_hashes::<ROW>(
+            buf,
+            tags,
+            positions,
+            &mut hashes,
+            (next_to_update - base) as usize,
+            ilimit,
+            hash_bits,
+        );
 
         // Searches the repeat offsets and the row of `ip` for the most valuable match at `ip`, after inserting
         // the positions before `ip`, and inserts `ip`. Returns the length, offset and value (see `score`) of the
         // match; the length is 0 if none was found.
-        let mut search = |rep: &[u32; 3], ip: usize| -> (usize, usize, i64) {
-            let cur = ip as u32 + base;
-            while next_to_update < cur {
-                let pos = (next_to_update - base) as usize;
-                let h =
-                    next_row_hash::<ROW>(buf, tags, positions, &mut hashes, pos, ilimit, hash_bits);
-                insert_in_row::<ROW>(tags, positions, h, next_to_update);
-                next_to_update += 1;
-            }
-            next_to_update = cur + 1;
-            let h = next_row_hash::<ROW>(buf, tags, positions, &mut hashes, ip, ilimit, hash_bits);
-
-            let low_limit = usize::max(ip.saturating_sub(window_size), src_floor);
-            let low_abs = low_limit as u32 + base;
-            let mut best_len = 0;
-            let mut best_offset = 0;
-            let mut best_score = i64::MIN;
-            // A match is at least five bytes: most candidates differ in the first four, which one comparison tells
-            let first_bytes = read_u32(buf, ip);
-            for &offset in rep {
-                let offset = offset as usize;
-                if offset > ip || ip - offset < low_limit || offset == best_offset {
-                    continue;
-                }
-                if read_u32(buf, ip - offset) != first_bytes {
-                    continue;
-                }
-                let len = common_prefix_len(buf, ip - offset, ip, block_end);
-                if len >= LAZY_MIN_MATCH && score_rep(len) > best_score {
-                    best_len = len;
-                    best_offset = offset;
-                    best_score = score_rep(len);
-                }
-            }
-            if ip + best_len < block_end {
-                let first = (h >> 8) * ROW;
-                let (Some(row_tags), Some(row)) = (
-                    tags.get(first..first + ROW)
-                        .and_then(|row| <&[u8; ROW]>::try_from(row).ok()),
-                    positions
-                        .get(first..first + ROW)
-                        .and_then(|row| <&[u32; ROW]>::try_from(row).ok()),
-                ) else {
-                    unreachable!("the tables hold every row of the hash");
-                };
-                let head = row_tags[0] as usize % ROW;
-                // The entries with the tag of this position (but the first, which is no entry), the most recent
-                // in the lowest bit
-                let mut found = tag_matches(row_tags, h as u8) & !1;
-                found = if ROW < 64 {
-                    ((found >> head) | (found << (ROW - head))) & ((1u64 << ROW) - 1)
+        //
+        // As the reference implementation (`lazySkipping`, `ZSTD_row_update`), not every position before `ip`
+        // is inserted. While the search is `skipping`, none is: only the positions that are searched. And of
+        // a long stretch (a long match, mostly) only the start and the end are, which are the positions the
+        // matches that follow are most likely to be found from. The hashes computed ahead of time are those
+        // of consecutive positions, so they are computed anew after a jump (`refill`, or a long stretch).
+        let mut search =
+            |rep: &[u32; 3], ip: usize, skipping: bool, refill: bool| -> (usize, usize, i64) {
+                let cur = ip as u32 + base;
+                let h = if skipping {
+                    hash_lazy(buf, ip, hash_bits)
                 } else {
-                    found.rotate_right(head as u32)
-                };
-                // The bytes of the candidates are fetched into the cache before any is compared, so that the waits
-                // for them overlap instead of following one another
-                let mut count = 0;
-                let mut ahead = found;
-                while ahead != 0 && count < depth {
-                    let candidate = row[(head + ahead.trailing_zeros() as usize) % ROW];
-                    if candidate < low_abs || candidate >= cur {
-                        // Older entries are further away still
-                        break;
+                    let mut refill = refill;
+                    if cur.saturating_sub(next_to_update) > ROW_SKIP_THRESHOLD {
+                        if refill {
+                            let from = (next_to_update - base) as usize;
+                            fill_row_hashes::<ROW>(
+                                buf,
+                                tags,
+                                positions,
+                                &mut hashes,
+                                from,
+                                ilimit,
+                                hash_bits,
+                            );
+                        }
+                        for _ in 0..ROW_INSERT_AT_START {
+                            let pos = (next_to_update - base) as usize;
+                            let h = next_row_hash::<ROW>(
+                                buf,
+                                tags,
+                                positions,
+                                &mut hashes,
+                                pos,
+                                ilimit,
+                                hash_bits,
+                            );
+                            insert_in_row::<ROW>(tags, positions, h, next_to_update);
+                            next_to_update += 1;
+                        }
+                        next_to_update = cur - ROW_INSERT_AT_END;
+                        refill = true;
                     }
-                    ahead &= ahead - 1;
-                    prefetch(buf, (candidate - base) as usize);
-                    count += 1;
+                    if refill {
+                        let from = (next_to_update - base) as usize;
+                        fill_row_hashes::<ROW>(
+                            buf,
+                            tags,
+                            positions,
+                            &mut hashes,
+                            from,
+                            ilimit,
+                            hash_bits,
+                        );
+                    }
+                    while next_to_update < cur {
+                        let pos = (next_to_update - base) as usize;
+                        let h = next_row_hash::<ROW>(
+                            buf,
+                            tags,
+                            positions,
+                            &mut hashes,
+                            pos,
+                            ilimit,
+                            hash_bits,
+                        );
+                        insert_in_row::<ROW>(tags, positions, h, next_to_update);
+                        next_to_update += 1;
+                    }
+                    next_row_hash::<ROW>(buf, tags, positions, &mut hashes, ip, ilimit, hash_bits)
+                };
+                next_to_update = cur + 1;
+
+                let low_limit = usize::max(ip.saturating_sub(window_size), src_floor);
+                let low_abs = low_limit as u32 + base;
+                let mut best_len = 0;
+                let mut best_offset = 0;
+                let mut best_score = i64::MIN;
+                // A match is at least five bytes: most candidates differ in the first four, which one comparison tells
+                let first_bytes = read_u32(buf, ip);
+                for &offset in rep {
+                    let offset = offset as usize;
+                    if offset > ip || ip - offset < low_limit || offset == best_offset {
+                        continue;
+                    }
+                    if read_u32(buf, ip - offset) != first_bytes {
+                        continue;
+                    }
+                    let len = common_prefix_len(buf, ip - offset, ip, block_end);
+                    if len >= LAZY_MIN_MATCH && score_rep(len) > best_score {
+                        best_len = len;
+                        best_offset = offset;
+                        best_score = score_rep(len);
+                    }
                 }
-                for _ in 0..count {
-                    let candidate = row[(head + found.trailing_zeros() as usize) % ROW];
-                    found &= found - 1;
-                    let cand = (candidate - base) as usize;
-                    if read_u32(buf, cand) == first_bytes
-                        && buf[cand + best_len] == buf[ip + best_len]
-                    {
-                        let len = common_prefix_len(buf, cand, ip, block_end);
-                        let offset = ip - cand;
-                        let value = if rep.contains(&(offset as u32)) {
-                            score_rep(len)
-                        } else {
-                            score(len, offset)
-                        };
-                        if len >= LAZY_MIN_MATCH && value > best_score {
-                            best_len = len;
-                            best_offset = offset;
-                            best_score = value;
-                            if ip + len == block_end {
-                                break;
+                if ip + best_len < block_end {
+                    let first = (h >> 8) * ROW;
+                    let (Some(row_tags), Some(row)) = (
+                        tags.get(first..first + ROW)
+                            .and_then(|row| <&[u8; ROW]>::try_from(row).ok()),
+                        positions
+                            .get(first..first + ROW)
+                            .and_then(|row| <&[u32; ROW]>::try_from(row).ok()),
+                    ) else {
+                        unreachable!("the tables hold every row of the hash");
+                    };
+                    let head = row_tags[0] as usize % ROW;
+                    // The entries with the tag of this position (but the first, which is no entry), the most recent
+                    // in the lowest bit
+                    let mut found = tag_matches(row_tags, h as u8) & !1;
+                    found = if ROW < 64 {
+                        ((found >> head) | (found << (ROW - head))) & ((1u64 << ROW) - 1)
+                    } else {
+                        found.rotate_right(head as u32)
+                    };
+                    // The bytes of the candidates are fetched into the cache before any is compared, so that the waits
+                    // for them overlap instead of following one another
+                    let mut count = 0;
+                    let mut ahead = found;
+                    while ahead != 0 && count < depth {
+                        let candidate = row[(head + ahead.trailing_zeros() as usize) % ROW];
+                        if candidate < low_abs || candidate >= cur {
+                            // Older entries are further away still
+                            break;
+                        }
+                        ahead &= ahead - 1;
+                        prefetch(buf, (candidate - base) as usize);
+                        count += 1;
+                    }
+                    for _ in 0..count {
+                        let candidate = row[(head + found.trailing_zeros() as usize) % ROW];
+                        found &= found - 1;
+                        let cand = (candidate - base) as usize;
+                        if read_u32(buf, cand) == first_bytes
+                            && buf[cand + best_len] == buf[ip + best_len]
+                        {
+                            let len = common_prefix_len(buf, cand, ip, block_end);
+                            let offset = ip - cand;
+                            let value = if rep.contains(&(offset as u32)) {
+                                score_rep(len)
+                            } else {
+                                score(len, offset)
+                            };
+                            if len >= LAZY_MIN_MATCH && value > best_score {
+                                best_len = len;
+                                best_offset = offset;
+                                best_score = value;
+                                if ip + len == block_end {
+                                    break;
+                                }
                             }
                         }
                     }
                 }
-            }
-            insert_in_row::<ROW>(tags, positions, h, cur);
-            (best_len, best_offset, best_score)
-        };
+                insert_in_row::<ROW>(tags, positions, h, cur);
+                (best_len, best_offset, best_score)
+            };
 
         let mut ip = block_start;
         let mut anchor = block_start;
 
+        // Where nothing was found for about 2 KiB, positions that are not searched are not inserted either
+        let mut skipping = false;
+        // The hashes computed ahead of time are not those of the next positions to insert
+        let mut refill = false;
+
         while ip <= ilimit {
-            let (mut match_len, mut offset, mut value) = search(&rep, ip);
+            let (mut match_len, mut offset, mut value) = search(&rep, ip, skipping, refill);
+            refill &= skipping;
             let mut start = ip;
             if match_len < LAZY_MIN_MATCH {
                 // Nothing found, skip faster the longer we did not find anything
-                ip += ((ip - anchor) >> SEARCH_STRENGTH) + 1;
+                let step = ((ip - anchor) >> SEARCH_STRENGTH) + 1;
+                ip += step;
+                skipping = step > LAZY_SKIPPING_STEP;
+                refill |= skipping;
                 continue;
             }
 
@@ -1382,7 +1466,8 @@ impl WindowMatcher {
             let mut lazy_step = 0;
             while lazy_step < lazy_steps && ip < ilimit {
                 ip += 1;
-                let (len2, offset2, value2) = search(&rep, ip);
+                let (len2, offset2, value2) = search(&rep, ip, skipping, refill);
+                refill &= skipping;
                 if len2 >= LAZY_MIN_MATCH {
                     // The further we already moved away from `start` the more the new match has to gain
                     let gain1 = value + 4 + 3 * lazy_step as i64;
@@ -1417,6 +1502,8 @@ impl WindowMatcher {
 
             ip = start + match_len;
             anchor = ip;
+            // A match was found: every position is inserted again
+            skipping = false;
         }
 
         self.rep = rep;
@@ -1526,6 +1613,29 @@ fn next_row_hash<const ROW: usize>(
         }
     }
     h
+}
+
+/// Computes the hashes of the [`ROW_LOOKAHEAD`] positions from `from` on and asks for their rows, for
+/// [`next_row_hash`] to go on from `from`
+#[inline(always)]
+fn fill_row_hashes<const ROW: usize>(
+    buf: &[u8],
+    tags: &[u8],
+    positions: &[u32],
+    hashes: &mut [u32; ROW_LOOKAHEAD],
+    from: usize,
+    ilimit: usize,
+    hash_bits: u32,
+) {
+    for pos in from..usize::min(from + ROW_LOOKAHEAD, ilimit + 1) {
+        let hash = hash_lazy(buf, pos, hash_bits);
+        hashes[pos % ROW_LOOKAHEAD] = hash as u32;
+        let first = (hash >> 8) * ROW;
+        prefetch(tags, first);
+        for line in 0..ROW / 16 {
+            prefetch(positions, first + 16 * line);
+        }
+    }
 }
 
 /// Writes a position to its row of `ROW` entries, before the entry written last.
@@ -1865,6 +1975,35 @@ mod tests {
                 let zeros = alloc::vec![0u8; 400_000];
                 roundtrip(&mut matcher, params, &zeros, None, hint);
                 roundtrip(&mut matcher, params, &zeros, Some(2), hint);
+            }
+        }
+    }
+
+    #[test]
+    fn matches_are_found_again_after_a_stretch_without_any() {
+        // Long enough without a match for the searches to grow far apart, and for the lazy strategy to stop
+        // inserting the positions between them; then data from the start, and a long run
+        let noise = pseudo_random(200_000, 21);
+        let mut data = noise.clone();
+        data.extend_from_slice(&noise[..1500]);
+        data.extend_from_slice(&pseudo_random(3000, 22));
+        data.extend_from_slice(&noise[500..1500]);
+        data.extend_from_slice(&[7u8; 50_000]);
+        data.extend_from_slice(&noise[100..1100]);
+        data.extend_from_slice(&pseudo_random(30_000, 23));
+        for params in all_params() {
+            let mut matcher = WindowMatcher::new(params);
+            for hint in [false, true] {
+                let sequences = roundtrip(&mut matcher, params, &data, None, hint);
+                // The run, and something from the start unless the tables are small and forgot it
+                let remembers = params.hash_log >= 14;
+                assert!(
+                    sequences >= if remembers { 4 } else { 1 },
+                    "{:?}: {} sequences",
+                    params,
+                    sequences
+                );
+                roundtrip(&mut matcher, params, &data, Some(2), hint);
             }
         }
     }
