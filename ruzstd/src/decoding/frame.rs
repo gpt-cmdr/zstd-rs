@@ -239,3 +239,55 @@ impl FrameDescriptor {
         }
     }
 }
+
+/// The number of bytes the frames of `data` decode to, as their headers record it: `None` when a
+/// frame does not record its content size, or when `data` is not whole frames one after another
+/// (skippable frames, which decode to nothing, among them).
+///
+/// It is what a caller needs to size the output of
+/// [`FrameDecoder::decode_all`](super::FrameDecoder::decode_all): the frames of
+/// [`Compressor`](crate::encoding::Compressor), and of any encoder given a whole buffer, record
+/// their size. The sizes are those the headers claim: decoding is what tells whether the content
+/// has them.
+pub fn content_size(mut data: &[u8]) -> Option<u64> {
+    let mut total = 0u64;
+    loop {
+        let mut source = data;
+        let header = match read_frame_header(&mut source) {
+            Ok((header, _)) => header,
+            Err(ReadFrameHeaderError::SkipFrame { length, .. }) => {
+                data = data.get(8 + length as usize..)?;
+                if data.is_empty() {
+                    return Some(total);
+                }
+                continue;
+            }
+            Err(_) => return None,
+        };
+        let descriptor = &header.descriptor;
+        if descriptor.frame_content_size_flag() == 0 && !descriptor.single_segment_flag() {
+            return None;
+        }
+        total = total.checked_add(header.frame_content_size())?;
+        // The blocks, each after three bytes that hold its size, to the last one
+        loop {
+            let (head, rest) = source.split_first_chunk::<3>()?;
+            let size = usize::from(head[0] >> 3)
+                | (usize::from(head[1]) << 5)
+                | (usize::from(head[2]) << 13);
+            // A block of one repeated byte holds that byte
+            let size = if (head[0] >> 1) & 3 == 1 { 1 } else { size };
+            source = rest.get(size..)?;
+            if head[0] & 1 == 1 {
+                break;
+            }
+        }
+        if descriptor.content_checksum_flag() {
+            source = source.get(4..)?;
+        }
+        data = source;
+        if data.is_empty() {
+            return Some(total);
+        }
+    }
+}

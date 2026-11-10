@@ -203,3 +203,39 @@ fn checks_the_checksum_of_a_frame() {
     // Without its last byte the frame has no whole checksum
     assert!(decoder.decode_all(&frame[..last], &mut out).is_err());
 }
+
+/// The size the headers of whole frames record, and none for frames that record none or are cut.
+#[test]
+fn content_size_is_that_of_the_frame_headers() {
+    use crate::decoding::content_size;
+    use crate::encoding::{CompressionLevel, Compressor};
+    let data = sample(300_000, 8);
+    let mut compressor = Compressor::new(CompressionLevel::Default);
+    let sized = compressor.compress(&data);
+    let small = compressor.compress(&data[..77]);
+    let skip = [
+        &0x184D_2A53u32.to_le_bytes()[..],
+        &3u32.to_le_bytes(),
+        &[9, 9, 9],
+    ]
+    .concat();
+    assert_eq!(content_size(&sized), Some(300_000));
+    assert_eq!(content_size(&compressor.compress(&[])), Some(0));
+    assert_eq!(
+        content_size(&[&sized[..], &skip, &small, &skip].concat()),
+        Some(300_077)
+    );
+    assert_eq!(
+        content_size(&zstd::bulk::compress(&data, 3).unwrap()),
+        Some(300_000)
+    );
+    // Frames of a stream do not record their size (the first block of this one is not the last)
+    let unsized_frame = zstd::stream::encode_all(&data[..], 3).unwrap();
+    assert_eq!(content_size(&unsized_frame), None);
+    assert_eq!(content_size(&[&sized[..], &unsized_frame].concat()), None);
+    for cut in [0, 1, 5, sized.len() / 2, sized.len() - 1] {
+        assert_eq!(content_size(&sized[..cut]), None, "cut at {}", cut);
+    }
+    assert_eq!(content_size(&[&sized[..], &[0]].concat()), None);
+    assert_eq!(content_size(&skip[..9]), None);
+}
