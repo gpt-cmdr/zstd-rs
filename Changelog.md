@@ -15,7 +15,7 @@ chunk, on an x86-64 desktop. `cargo run --release --example rasterbench` reprodu
   bitstream is refilled at most twice per sequence. The bytes of the output after those of the frames may be
   written to.
 * Huffman-coded literals are decoded four streams side by side through an 11-bit table, five lookups per refill,
-  and two symbols per lookup where the literals compress well. The streaming decoder uses the same decoding
+  and two symbols per lookup where the literals compress well
 * The streaming decoder (`StreamingDecoder`, `FrameDecoder::decode_blocks` and what collects from it, `decode_from_to`,
   `decode_all` for frames with a dictionary) decodes blocks with the code of `decode_all`, straight into its window
   buffer: no vector of sequences, no ring buffer. The window buffer is a zeroed `Vec<u8>` in which a block is always
