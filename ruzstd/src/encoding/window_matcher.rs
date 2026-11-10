@@ -617,17 +617,28 @@ impl WindowMatcher {
         }
     }
 
+    /// The lowest index a match of the greedy strategies may start at. Computed for the end of the block, so
+    /// it holds for every position in it.
+    fn low(&self, block_end: usize) -> usize {
+        if self.dict_usable(block_end) {
+            0
+        } else {
+            usize::max(
+                self.frame_base,
+                block_end.saturating_sub(self.params.window_size()),
+            )
+        }
+    }
+
     pub(crate) fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         match self.params.strategy {
             // Recording the written slots is only needed in frames with a dictionary
-            Strategy::Fast if self.tables.tracking => {
-                self.match_greedy::<false, true>(handle_sequence)
-            }
-            Strategy::Fast => self.match_greedy::<false, false>(handle_sequence),
+            Strategy::Fast if self.tables.tracking => self.match_fast::<true>(handle_sequence),
+            Strategy::Fast => self.match_fast::<false>(handle_sequence),
             Strategy::DoubleFast if self.tables.tracking => {
-                self.match_greedy::<true, true>(handle_sequence)
+                self.match_double_fast::<true>(handle_sequence)
             }
-            Strategy::DoubleFast => self.match_greedy::<true, false>(handle_sequence),
+            Strategy::DoubleFast => self.match_double_fast::<false>(handle_sequence),
             Strategy::Lazy => match self.tables.row_log {
                 0 => self.match_lazy(handle_sequence),
                 4 => self.match_lazy_rows::<16>(handle_sequence),
@@ -637,31 +648,199 @@ impl WindowMatcher {
         }
     }
 
-    /// The greedy strategies: [`Strategy::Fast`] (`DOUBLE == false`) and [`Strategy::DoubleFast`]
-    fn match_greedy<const DOUBLE: bool, const TRACK: bool>(
+    /// [`Strategy::Fast`]: one table of the positions of `min_match`-byte prefixes.
+    ///
+    /// The loop is the one of the reference implementation (`ZSTD_compressBlock_fast_noDict_generic`): it looks
+    /// at two positions per turn, with the hash of each computed and its table entry loaded while the position
+    /// before it is still being compared, and tries the most recent offset once per turn, two positions ahead.
+    /// Where nothing is found for a while the turns start to skip a position, then two, and so on.
+    fn match_fast<const TRACK: bool>(
         &mut self,
         mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
     ) {
+        /// The step between two turns grows by one for every this many bytes without a match
+        const STEP_INCR: usize = 1 << (SEARCH_STRENGTH - 1);
+
         let block_start = self.block_start;
         let block_end = self.buf.len();
-        if block_end - block_start <= READ_SIZE {
-            if block_end > block_start {
-                handle_sequence(Sequence::Literals {
-                    literals: &self.buf[block_start..],
-                });
-            }
-            return;
-        }
-        // The lowest index a match may start at. Computed for the end of the block, so it holds for every position
-        // in it.
-        let low = if self.dict_usable(block_end) {
-            0
-        } else {
-            usize::max(
-                self.frame_base,
-                block_end.saturating_sub(self.params.window_size()),
-            )
+        let low = self.low(block_end);
+        let base = self.base;
+        let low_abs = low as u32 + base;
+        let params = self.params;
+        let buf = self.buf.as_slice();
+        // The table as a slice of its own: a write to it then says nothing about where anything else is
+        let Tables {
+            hash,
+            tracking,
+            dict_baseline,
+            touched_hash,
+            touched_chain,
+            touched_limit,
+            ..
+        } = &mut self.tables;
+        let hash = hash.as_mut_slice();
+        let mut touched = Touched {
+            tracking,
+            dict_baseline,
+            touched_hash,
+            touched_chain,
+            touched_limit: *touched_limit,
         };
+        // Sets a slot of the table, recording it in frames with a dictionary (`TRACK`)
+        macro_rules! set {
+            ($slot:expr, $value:expr) => {{
+                let slot = $slot;
+                hash[slot] = $value;
+                if TRACK && *touched.tracking {
+                    touched.touch(slot, true);
+                }
+            }};
+        }
+        let hasher = ShortHash::new(params.min_match, params.hash_log);
+        let mut rep = self.rep;
+        let mut anchor = block_start;
+
+        if block_end - block_start > READ_SIZE {
+            // Last position at which eight bytes can be read
+            let ilimit = block_end - READ_SIZE;
+            // The first byte of the frame has nothing to match against
+            let mut ip = block_start + usize::from(block_start == low);
+            // The most recent offset, or 0 while it reaches below `low`. After a match it never does.
+            let mut r1 = match ip.checked_sub(low) {
+                Some(reach) if rep[0] as usize <= reach => rep[0] as usize,
+                _ => 0,
+            };
+
+            'block: loop {
+                let mut step = 2;
+                let mut next_step = ip + STEP_INCR;
+                // This turn looks at `ip` and `ip + 1`, and at `ahead` for the most recent offset; the next
+                // turn starts at `ahead`
+                let mut ahead = ip + step;
+                if ahead + 1 >= ilimit {
+                    break 'block;
+                }
+                let v = read_u64(buf, ip);
+                let mut h0 = hasher.hash(v);
+                let mut w0 = v as u32;
+                let v = read_u64(buf, ip + 1);
+                let mut h1 = hasher.hash(v);
+                let mut w1 = v as u32;
+                let mut cand = hash[h0];
+
+                // The search ends with a match of `len` bytes so far at `start`, `offset` bytes back, and the
+                // position it was found from
+                let (mut start, offset, mut len, searched);
+                loop {
+                    let v_ahead = read_u64(buf, ahead);
+                    set!(h0, ip as u32 + base);
+                    if read_u32(buf, ahead - r1) == v_ahead as u32 && r1 != 0 {
+                        set!(h1, (ip + 1) as u32 + base);
+                        // `ahead - r1 >= low + 2`, and `ahead - 1 > anchor`: one byte back can be looked at
+                        let back = usize::from(buf[ahead - 1] == buf[ahead - 1 - r1]);
+                        start = ahead - back;
+                        offset = r1;
+                        len = 4 + back;
+                        searched = ip;
+                        break;
+                    }
+                    if cand >= low_abs {
+                        let m = (cand - base) as usize;
+                        if read_u32(buf, m) == w0 {
+                            set!(h1, (ip + 1) as u32 + base);
+                            (start, offset, len) = extend_back(buf, ip, m, anchor, low, 4);
+                            searched = ip;
+                            break;
+                        }
+                    }
+                    let cand1 = hash[h1];
+                    let h_ahead = hasher.hash(v_ahead);
+                    set!(h1, (ip + 1) as u32 + base);
+                    if cand1 >= low_abs {
+                        let m = (cand1 - base) as usize;
+                        if read_u32(buf, m) == w1 {
+                            if step <= 4 {
+                                set!(h_ahead, ahead as u32 + base);
+                            }
+                            (start, offset, len) = extend_back(buf, ip + 1, m, anchor, low, 4);
+                            searched = ip + 1;
+                            break;
+                        }
+                    }
+                    cand = hash[h_ahead];
+                    let v = read_u64(buf, ahead + 1);
+                    h0 = h_ahead;
+                    w0 = v_ahead as u32;
+                    h1 = hasher.hash(v);
+                    w1 = v as u32;
+                    ip = ahead;
+                    ahead = ip + step;
+                    if ahead >= next_step {
+                        step += 1;
+                        next_step += STEP_INCR;
+                    }
+                    if ahead + 1 >= ilimit {
+                        break 'block;
+                    }
+                }
+                len += common_prefix_len(buf, start - offset + len, start + len, block_end);
+                push_offset(&mut rep, offset as u32, start > anchor);
+
+                // Fill the table with two positions of the match
+                if start + len <= ilimit {
+                    let fill = searched + 2;
+                    set!(hasher.hash(read_u64(buf, fill)), fill as u32 + base);
+                    let fill = start + len - 2;
+                    set!(hasher.hash(read_u64(buf, fill)), fill as u32 + base);
+                }
+                let mut offset = offset;
+                loop {
+                    handle_sequence(Sequence::Triple {
+                        literals: &buf[anchor..start],
+                        offset,
+                        match_len: len,
+                    });
+                    ip = start + len;
+                    anchor = ip;
+                    // An immediate match at the second most recent offset, which is cheap to encode without
+                    // literals
+                    let r2 = rep[1] as usize;
+                    if ip > ilimit || ip < low + r2 || read_u32(buf, ip - r2) != read_u32(buf, ip) {
+                        break;
+                    }
+                    set!(hasher.hash(read_u64(buf, ip)), ip as u32 + base);
+                    start = ip;
+                    offset = r2;
+                    len = 4 + common_prefix_len(buf, ip - r2 + 4, ip + 4, block_end);
+                    push_offset(&mut rep, r2 as u32, false);
+                }
+                r1 = rep[0] as usize;
+            }
+        }
+
+        self.rep = rep;
+        if anchor < block_end {
+            handle_sequence(Sequence::Literals {
+                literals: &buf[anchor..block_end],
+            });
+        }
+    }
+
+    /// [`Strategy::DoubleFast`]: a table of the positions of 8-byte prefixes in `hash` and one of
+    /// `min_match`-byte prefixes in `chain`. The long table finds the long matches, the short one the rest.
+    ///
+    /// The loop is the one of the reference implementation (`ZSTD_compressBlock_doubleFast_noDict_generic`):
+    /// the long hash of the next position is computed and its entry loaded one position ahead.
+    fn match_double_fast<const TRACK: bool>(
+        &mut self,
+        mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        /// The step between two positions grows by one for every this many bytes without a match
+        const STEP_INCR: usize = 1 << SEARCH_STRENGTH;
+
+        let block_start = self.block_start;
+        let block_end = self.buf.len();
+        let low = self.low(block_end);
         let base = self.base;
         let low_abs = low as u32 + base;
         let params = self.params;
@@ -677,8 +856,8 @@ impl WindowMatcher {
             touched_limit,
             ..
         } = &mut self.tables;
-        let hash = hash.as_mut_slice();
-        let chain = chain.as_mut_slice();
+        let long = hash.as_mut_slice();
+        let short = chain.as_mut_slice();
         let mut touched = Touched {
             tracking,
             dict_baseline,
@@ -692,173 +871,152 @@ impl WindowMatcher {
                 let slot = $slot;
                 $table[slot] = $value;
                 if TRACK && *touched.tracking {
-                    touched.touch(slot, stringify!($table) == "hash");
+                    touched.touch(slot, stringify!($table) == "long");
                 }
             }};
         }
+        let short_hash = ShortHash::new(params.min_match, params.chain_log);
+        let long_hash = ShortHash::new(8, params.hash_log);
         let mut rep = self.rep;
-        // Last position at which a search can be started
-        let ilimit = block_end - READ_SIZE;
-        // The short hash lives in `hash` for Fast and in `chain` for DoubleFast
-        let short = ShortHash::new(
-            params.min_match,
-            if DOUBLE {
-                params.chain_log
-            } else {
-                params.hash_log
-            },
-        );
-        let long_log = params.hash_log;
-
-        let mut ip = block_start;
         let mut anchor = block_start;
-        // The first byte of the frame has nothing to match against
-        if ip == low {
-            ip += 1;
-        }
 
-        'search: while ip < ilimit {
-            let v = read_u64(buf, ip);
-            let cur = ip as u32 + base;
-            let h_s = short.hash(v);
-            let (cand_long, cand_short) = if DOUBLE {
-                let h_l = hash8(v, long_log);
-                let cand_long = hash[h_l];
-                let cand_short = chain[h_s];
-                set!(hash, h_l, cur);
-                set!(chain, h_s, cur);
-                (cand_long, cand_short)
-            } else {
-                let cand = hash[h_s];
-                set!(hash, h_s, cur);
-                (0, cand)
+        if block_end - block_start > READ_SIZE {
+            // Last position at which eight bytes can be read
+            let ilimit = block_end - READ_SIZE;
+            // The first byte of the frame has nothing to match against
+            let mut ip = block_start + usize::from(block_start == low);
+            // The most recent offset, or 0 while it reaches below `low`. After a match it never does.
+            let mut r1 = match ip.checked_sub(low) {
+                Some(reach) if rep[0] as usize <= reach => rep[0] as usize,
+                _ => 0,
             };
 
-            // Search: the most recent offset at the next position, then a long match, then a short match
-            let (start, offset, match_len);
-            let r1 = rep[0] as usize;
-            if r1 <= ip + 1 - low && read_u32(buf, ip + 1 - r1) == read_u32(buf, ip + 1) {
-                start = ip + 1;
-                offset = r1;
-                match_len = 4 + common_prefix_len(buf, start - r1 + 4, start + 4, block_end);
-            } else {
-                let found = if DOUBLE && cand_long >= low_abs {
-                    let m = (cand_long - base) as usize;
-                    if read_u64(buf, m) == v {
-                        Some((ip, m, 8 + common_prefix_len(buf, m + 8, ip + 8, block_end)))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                let found = match found {
-                    Some(found) => found,
-                    None => {
-                        if cand_short < low_abs {
-                            ip += ((ip - anchor) >> SEARCH_STRENGTH) + 1;
-                            continue 'search;
-                        }
-                        let m = (cand_short - base) as usize;
-                        if read_u32(buf, m) != v as u32 {
-                            ip += ((ip - anchor) >> SEARCH_STRENGTH) + 1;
-                            continue 'search;
-                        }
-                        // A short match. A long match at the next position might be better.
-                        let long_next = if DOUBLE {
-                            let v1 = read_u64(buf, ip + 1);
-                            let h_l1 = hash8(v1, long_log);
-                            let cand = hash[h_l1];
-                            set!(hash, h_l1, cur + 1);
-                            let m1 = (cand.wrapping_sub(base)) as usize;
-                            if cand >= low_abs && read_u64(buf, m1) == v1 {
-                                Some((
-                                    ip + 1,
-                                    m1,
-                                    8 + common_prefix_len(buf, m1 + 8, ip + 9, block_end),
-                                ))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-                        long_next.unwrap_or_else(|| {
-                            (ip, m, 4 + common_prefix_len(buf, m + 4, ip + 4, block_end))
-                        })
-                    }
-                };
-                // Catch up: the match might extend backwards into the literals
-                let (mut s, mut m, mut len) = found;
-                while s > anchor && m > low && buf[s - 1] == buf[m - 1] {
-                    s -= 1;
-                    m -= 1;
-                    len += 1;
+            'block: loop {
+                let mut step = 1;
+                let mut next_step = ip + STEP_INCR;
+                let mut ip1 = ip + step;
+                if ip1 > ilimit {
+                    break 'block;
                 }
-                start = s;
-                offset = s - m;
-                match_len = len;
-            }
+                let mut v = read_u64(buf, ip);
+                let mut hl0 = long_hash.hash(v);
+                let mut cand_long = long[hl0];
 
-            encode_offset_value(offset as u32, (start - anchor) as u32, &mut rep);
-            handle_sequence(Sequence::Triple {
-                literals: &buf[anchor..start],
-                offset,
-                match_len,
-            });
-            let searched = ip;
-            ip = start + match_len;
-            anchor = ip;
+                // The search ends with a match of `len` bytes at `start`, `offset` bytes back, and the position
+                // it was found from
+                let (start, offset, len, searched);
+                loop {
+                    let hs0 = short_hash.hash(v);
+                    let cand_short = short[hs0];
+                    let cur = ip as u32 + base;
+                    set!(long, hl0, cur);
+                    set!(short, hs0, cur);
 
-            if ip <= ilimit {
-                // Fill the tables with a few positions of the match
-                let fill = searched + 2;
-                if DOUBLE {
-                    let v = read_u64(buf, fill);
-                    set!(hash, hash8(v, long_log), fill as u32 + base);
-                    set!(chain, short.hash(v), fill as u32 + base);
-                    set!(
-                        hash,
-                        hash8(read_u64(buf, ip - 2), long_log),
-                        (ip - 2) as u32 + base
-                    );
-                    set!(
-                        chain,
-                        short.hash(read_u64(buf, ip - 1)),
-                        (ip - 1) as u32 + base
-                    );
-                } else {
-                    set!(hash, short.hash(read_u64(buf, fill)), fill as u32 + base);
-                    set!(
-                        hash,
-                        short.hash(read_u64(buf, ip - 2)),
-                        (ip - 2) as u32 + base
-                    );
-                }
-
-                // An immediate match at the second most recent offset, which is cheap to encode without literals
-                while ip <= ilimit {
-                    let r2 = rep[1] as usize;
-                    if r2 > ip - low || read_u32(buf, ip - r2) != read_u32(buf, ip) {
+                    // The most recent offset at the next position
+                    if read_u32(buf, ip + 1 - r1) == (v >> 8) as u32 && r1 != 0 {
+                        start = ip + 1;
+                        offset = r1;
+                        len = 4 + common_prefix_len(buf, start - r1 + 4, start + 4, block_end);
+                        searched = ip;
                         break;
                     }
-                    let len = 4 + common_prefix_len(buf, ip - r2 + 4, ip + 4, block_end);
-                    let v = read_u64(buf, ip);
-                    if DOUBLE {
-                        set!(hash, hash8(v, long_log), ip as u32 + base);
-                        set!(chain, short.hash(v), ip as u32 + base);
-                    } else {
-                        set!(hash, short.hash(v), ip as u32 + base);
+                    let v1 = read_u64(buf, ip1);
+                    let hl1 = long_hash.hash(v1);
+                    if cand_long >= low_abs {
+                        let m = (cand_long - base) as usize;
+                        if read_u64(buf, m) == v {
+                            let len0 = 8 + common_prefix_len(buf, m + 8, ip + 8, block_end);
+                            (start, offset, len) = extend_back(buf, ip, m, anchor, low, len0);
+                            if step < 4 {
+                                set!(long, hl1, ip1 as u32 + base);
+                            }
+                            searched = ip;
+                            break;
+                        }
                     }
-                    encode_offset_value(r2 as u32, 0, &mut rep);
+                    let cand_long1 = long[hl1];
+                    if cand_short >= low_abs {
+                        let m = (cand_short - base) as usize;
+                        if read_u32(buf, m) == v as u32 {
+                            // A short match. A long match at the next position might be better.
+                            let mut found =
+                                (ip, m, 4 + common_prefix_len(buf, m + 4, ip + 4, block_end));
+                            if cand_long1 >= low_abs {
+                                let m1 = (cand_long1 - base) as usize;
+                                if read_u64(buf, m1) == v1 {
+                                    let len1 =
+                                        8 + common_prefix_len(buf, m1 + 8, ip1 + 8, block_end);
+                                    if len1 > found.2 {
+                                        found = (ip1, m1, len1);
+                                    }
+                                }
+                            }
+                            (start, offset, len) =
+                                extend_back(buf, found.0, found.1, anchor, low, found.2);
+                            if step < 4 {
+                                set!(long, hl1, ip1 as u32 + base);
+                            }
+                            searched = ip;
+                            break;
+                        }
+                    }
+                    if ip1 >= next_step {
+                        step += 1;
+                        next_step += STEP_INCR;
+                    }
+                    ip = ip1;
+                    ip1 += step;
+                    v = v1;
+                    hl0 = hl1;
+                    cand_long = cand_long1;
+                    if ip1 > ilimit {
+                        break 'block;
+                    }
+                }
+                push_offset(&mut rep, offset as u32, start > anchor);
+
+                // Fill the tables with a few positions of the match
+                if start + len <= ilimit {
+                    let end = start + len;
+                    let fill = searched + 2;
+                    let v = read_u64(buf, fill);
+                    set!(long, long_hash.hash(v), fill as u32 + base);
+                    set!(short, short_hash.hash(v), fill as u32 + base);
+                    set!(
+                        long,
+                        long_hash.hash(read_u64(buf, end - 2)),
+                        (end - 2) as u32 + base
+                    );
+                    set!(
+                        short,
+                        short_hash.hash(read_u64(buf, end - 1)),
+                        (end - 1) as u32 + base
+                    );
+                }
+                let (mut start, mut offset, mut len) = (start, offset, len);
+                loop {
                     handle_sequence(Sequence::Triple {
-                        literals: &buf[ip..ip],
-                        offset: r2,
+                        literals: &buf[anchor..start],
+                        offset,
                         match_len: len,
                     });
-                    ip += len;
+                    ip = start + len;
                     anchor = ip;
+                    // An immediate match at the second most recent offset, which is cheap to encode without
+                    // literals
+                    let r2 = rep[1] as usize;
+                    if ip > ilimit || ip < low + r2 || read_u32(buf, ip - r2) != read_u32(buf, ip) {
+                        break;
+                    }
+                    let v = read_u64(buf, ip);
+                    set!(short, short_hash.hash(v), ip as u32 + base);
+                    set!(long, long_hash.hash(v), ip as u32 + base);
+                    start = ip;
+                    offset = r2;
+                    len = 4 + common_prefix_len(buf, ip - r2 + 4, ip + 4, block_end);
+                    push_offset(&mut rep, r2 as u32, false);
                 }
+                r1 = rep[0] as usize;
             }
         }
 
@@ -1258,8 +1416,9 @@ impl WindowMatcher {
 /// Hash of the first `min_match` bytes of a little endian `u64`
 #[derive(Clone, Copy)]
 struct ShortHash {
-    shift: u32,
-    prime: u64,
+    /// The multiplier of the reference implementation for the number of bytes, shifted up by the bits of the
+    /// bytes that do not count: `(v << shift) * prime` is `v * (prime << shift)`
+    multiplier: u64,
     hash_shift: u32,
 }
 
@@ -1275,16 +1434,48 @@ impl ShortHash {
         ];
         let min_match = min_match.clamp(4, 8);
         Self {
-            shift: 64 - 8 * min_match,
-            prime: PRIMES[min_match as usize - 4],
+            multiplier: PRIMES[min_match as usize - 4] << (64 - 8 * min_match),
             hash_shift: 64 - hash_log.max(1),
         }
     }
 
     #[inline(always)]
     fn hash(&self, v: u64) -> usize {
-        ((v << self.shift).wrapping_mul(self.prime) >> self.hash_shift) as usize
+        (v.wrapping_mul(self.multiplier) >> self.hash_shift) as usize
     }
+}
+
+/// The offset history (RFC 8878, section 3.1.2.5) after a sequence with this offset, with or without literals:
+/// what [`encode_offset_value`] does to it, without working out the offset code
+#[inline(always)]
+fn push_offset(rep: &mut [u32; 3], offset: u32, literals: bool) {
+    if literals && offset == rep[0] {
+        return;
+    }
+    *rep = [
+        offset,
+        rep[0],
+        if offset == rep[1] { rep[2] } else { rep[1] },
+    ];
+}
+
+/// Extend the match of `len` bytes at `start` with the bytes at `source` backwards into the literals, as far
+/// as the bytes before the two are equal. Returns the start, the offset and the length of the match.
+#[inline(always)]
+fn extend_back(
+    buf: &[u8],
+    mut start: usize,
+    mut source: usize,
+    anchor: usize,
+    low: usize,
+    mut len: usize,
+) -> (usize, usize, usize) {
+    while start > anchor && source > low && buf[start - 1] == buf[source - 1] {
+        start -= 1;
+        source -= 1;
+        len += 1;
+    }
+    (start, start - source, len)
 }
 
 #[inline(always)]
@@ -1561,6 +1752,30 @@ mod tests {
             } => seqs.push((literals.to_vec(), offset, match_len)),
         });
         seqs
+    }
+
+    #[test]
+    fn push_offset_keeps_the_history_of_the_encoder() {
+        // Few distinct values, so that every relation between the offset and the history occurs
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n) as u32
+        };
+        let mut history = INITIAL_OFFSET_HISTORY;
+        for round in 0..200_000 {
+            if round % 64 == 0 {
+                history = [1 + next(4), 1 + next(4), 1 + next(4)];
+            }
+            let offset = 1 + next(5);
+            let literals = next(2) == 1;
+            let mut expected = history;
+            encode_offset_value(offset, u32::from(literals), &mut expected);
+            push_offset(&mut history, offset, literals);
+            assert_eq!(history, expected, "offset {offset}, literals {literals}");
+        }
     }
 
     #[test]
