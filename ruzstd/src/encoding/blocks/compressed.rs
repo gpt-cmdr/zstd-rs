@@ -65,39 +65,53 @@ pub fn compress_block<M: Matcher>(
         ..
     } = state;
     let mut offset_history = *offset_history;
-    literals_buf.clear();
     sequences_buf.clear();
-    // Enough for most blocks, so the buffers do not grow in small steps while matching
+    // The literals are gathered at the start of a buffer that is never shorter than the block and the reach
+    // of a short copy, so appending a run does not have to make room first
     let block_len = matcher.get_last_space().len();
-    literals_buf.reserve(block_len);
+    if literals_buf.len() < block_len + SHORT_RUN {
+        literals_buf.resize(block_len + SHORT_RUN, 0);
+    }
+    // Enough for most blocks, so the buffer does not grow in small steps while matching
     sequences_buf.reserve(block_len / 16);
+    let mut literals_len = 0;
+    // Kept small, so that it becomes part of the loops of the matchers: the codes are worked out afterwards
+    matcher.start_matching(
+        #[inline(always)]
+        |seq| match seq {
+            Sequence::Literals { literals } => {
+                literals_buf[literals_len..literals_len + literals.len()].copy_from_slice(literals);
+                literals_len += literals.len();
+            }
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => {
+                push_literals(literals_buf, literals_len, literals);
+                literals_len += literals.len();
+                sequences_buf.push(CodedSequence {
+                    ll: literals.len() as u32,
+                    ml: match_len as u32,
+                    of: offset as u32,
+                    ll_code: 0,
+                    ml_code: 0,
+                    of_code: 0,
+                });
+            }
+        },
+    );
     let mut counts = SymbolCounts::new();
-    matcher.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => literals_buf.extend_from_slice(literals),
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => {
-            push_literals(literals_buf, literals);
-            let ll = literals.len() as u32;
-            let ml = match_len as u32;
-            let of = encode_offset_value(offset as u32, ll, &mut offset_history);
-            let seq = CodedSequence {
-                ll,
-                ml,
-                of,
-                ll_code: ll_code(ll),
-                ml_code: ml_code(ml),
-                of_code: of.ilog2() as u8,
-            };
-            counts.ll[seq.ll_code as usize] += 1;
-            counts.ml[seq.ml_code as usize] += 1;
-            counts.of[seq.of_code as usize] += 1;
-            sequences_buf.push(seq);
-        }
-    });
-    let literals_vec = &state.literals_buf;
+    for seq in sequences_buf.iter_mut() {
+        seq.of = offset_value(seq.of, seq.ll, &mut offset_history);
+        seq.ll_code = ll_code(seq.ll);
+        seq.ml_code = ml_code(seq.ml);
+        seq.of_code = seq.of.ilog2() as u8;
+        counts.ll[seq.ll_code as usize] += 1;
+        counts.ml[seq.ml_code as usize] += 1;
+        counts.of[seq.of_code as usize] += 1;
+    }
+    let literals_vec = &state.literals_buf[..literals_len];
     let sequences = &state.sequences_buf;
 
     let mut entropy = BlockEntropy {
@@ -182,16 +196,31 @@ pub fn compress_block<M: Matcher>(
     entropy
 }
 
-/// Append the literals of a sequence. Most runs are a few bytes long, for which a call to `memcpy` costs more than
-/// the copy.
+/// The longest run of literals that is copied with a few fixed size moves instead of a call to `memcpy`, which
+/// costs more than the copy for the few bytes most runs have
+const SHORT_RUN: usize = 16;
+
+/// Copy the literals of a sequence to `buf[at..]`. `buf` is at least [`SHORT_RUN`] bytes longer than all
+/// literals of the block.
 #[inline(always)]
-fn push_literals(buf: &mut Vec<u8>, literals: &[u8]) {
-    if literals.len() <= 16 {
-        for &b in literals {
-            buf.push(b);
-        }
-    } else {
-        buf.extend_from_slice(literals);
+fn push_literals(buf: &mut [u8], at: usize, literals: &[u8]) {
+    let len = literals.len();
+    if len > SHORT_RUN {
+        buf[at..at + len].copy_from_slice(literals);
+        return;
+    }
+    // The two ends of the run, which overlap unless the run has just the length of both
+    let dst = &mut buf[at..at + SHORT_RUN];
+    if len >= 8 {
+        dst[..8].copy_from_slice(&literals[..8]);
+        dst[len - 8..len].copy_from_slice(&literals[len - 8..]);
+    } else if len >= 4 {
+        dst[..4].copy_from_slice(&literals[..4]);
+        dst[len - 4..len].copy_from_slice(&literals[len - 4..]);
+    } else if len > 0 {
+        dst[0] = literals[0];
+        dst[len / 2] = literals[len / 2];
+        dst[len - 1] = literals[len - 1];
     }
 }
 
@@ -252,6 +281,38 @@ pub(crate) fn encode_offset_value(offset: u32, literal_len: u32, history: &mut [
     }
     *history = [offset, rep1, rep2];
     offset + 3
+}
+
+/// [`encode_offset_value`] as selections instead of branches: whether a sequence repeats an offset is hard to
+/// predict.
+#[inline(always)]
+fn offset_value(offset: u32, literal_len: u32, history: &mut [u32; 3]) -> u32 {
+    debug_assert!(offset > 0);
+    let [rep1, rep2, rep3] = *history;
+    // The offsets that the codes 1, 2 and 3 stand for. Without literals the third one is the most recent
+    // offset minus one, which no offset equals if that is zero.
+    let (first, second, third) = if literal_len > 0 {
+        (rep1, rep2, rep3)
+    } else {
+        (rep2, rep3, rep1 - 1)
+    };
+    let mut value = offset + 3;
+    value = if offset == third { 3 } else { value };
+    value = if offset == second { 2 } else { value };
+    value = if offset == first { 1 } else { value };
+    // The history stays as it is for the most recent offset after literals. Every other offset moves to the
+    // front, from its place in the history if it has one.
+    let unchanged = literal_len > 0 && offset == rep1;
+    *history = [
+        if unchanged { rep1 } else { offset },
+        if unchanged { rep2 } else { rep1 },
+        if unchanged || offset == rep2 {
+            rep3
+        } else {
+            rep2
+        },
+    ];
+    value
 }
 
 /// How the symbols of one field of the sequences are encoded in a block
@@ -645,6 +706,45 @@ mod tests {
         assert_eq!(history, [1, 100, 4]);
         assert_eq!(encode_offset_value(4, 1, &mut history), 3);
         assert_eq!(history, [4, 1, 100]);
+    }
+
+    #[test]
+    fn literals_of_any_length_are_copied() {
+        let literals: alloc::vec::Vec<u8> = (0..200u8).collect();
+        for len in 0..=literals.len() {
+            let mut buf = alloc::vec![0xEEu8; 3 + len + super::SHORT_RUN];
+            super::push_literals(&mut buf, 3, &literals[..len]);
+            assert_eq!(&buf[..3], &[0xEE; 3]);
+            assert_eq!(&buf[3..3 + len], &literals[..len], "{len} literals");
+        }
+    }
+
+    #[test]
+    fn offset_values_by_selection_are_the_same() {
+        // Few distinct values, so that every relation between the offset and the history occurs
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n) as u32
+        };
+        let mut history = [1, 4, 8];
+        for round in 0..200_000 {
+            if round % 64 == 0 {
+                history = [1 + next(4), 1 + next(4), 1 + next(4)];
+            }
+            let offset = 1 + next(5);
+            let literal_len = next(3);
+            let mut expected = history;
+            let value = encode_offset_value(offset, literal_len, &mut expected);
+            assert_eq!(
+                super::offset_value(offset, literal_len, &mut history),
+                value,
+                "offset {offset}, {literal_len} literals"
+            );
+            assert_eq!(history, expected, "offset {offset}, {literal_len} literals");
+        }
     }
 
     #[test]
