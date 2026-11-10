@@ -199,6 +199,41 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         self.bits_in_partial += num_bits;
     }
 
+    /// Writes the codes of the symbols of `data`, from the last symbol to the first. A code of `codes` is
+    /// its number of bits (at most 11) in its lowest four bits and its bits above them.
+    ///
+    /// The codes of five symbols are gathered in a word (55 bits, next to at most 7 left from before) and
+    /// the word written to the output at once, which was sized for the longest codes beforehand.
+    pub fn add_codes_reversed(&mut self, data: &[u8], codes: &[u16; 256]) {
+        const SYMBOLS: usize = 5;
+        self.flush_full_bytes();
+        let output = self.output.as_mut();
+        let start = output.len();
+        output.resize(start + (data.len() * 11).div_ceil(8) + 16, 0);
+        let mut at = start;
+        let mut word = self.partial;
+        let mut bits = self.bits_in_partial as u32;
+        let (head, body) = data.split_at(data.len() % SYMBOLS);
+        for symbols in body.rchunks_exact(SYMBOLS).chain(core::iter::once(head)) {
+            for &symbol in symbols.iter().rev() {
+                let code = codes[symbol as usize];
+                debug_assert!(code & 15 != 0, "a symbol without a code");
+                word |= u64::from(code >> 4) << bits;
+                bits += u32::from(code & 15);
+            }
+            output[at..at + 8].copy_from_slice(&word.to_le_bytes());
+            // At most 62 bits were gathered: seven bytes at most are complete
+            let bytes = bits >> 3;
+            at += bytes as usize;
+            word >>= 8 * bytes;
+            bits &= 7;
+        }
+        output.truncate(at);
+        self.partial = word;
+        self.bits_in_partial = bits as usize;
+        self.bit_idx += 8 * (at - start);
+    }
+
     /// Move the complete bytes of the internal buffer to the output, leaving at most 7 bits buffered
     #[inline(always)]
     pub fn flush_full_bytes(&mut self) {
