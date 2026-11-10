@@ -6,7 +6,8 @@
 //! * [`Strategy::Fast`] ([`CompressionLevel::Fastest`]): one hash table, greedy matching.
 //! * [`Strategy::DoubleFast`] ([`CompressionLevel::Default`]): a table of 8-byte prefixes and a table of
 //!   `min_match`-byte prefixes, greedy matching. The long table finds the long matches, the short one the rest.
-//! * [`Strategy::Lazy`] ([`CompressionLevel::Better`] and [`CompressionLevel::Best`]): hash chains, and before a
+//! * [`Strategy::Lazy`] ([`CompressionLevel::Better`] and [`CompressionLevel::Best`]): rows of tagged positions
+//!   (hash chains in frames with a dictionary), and before a
 //!   match is emitted the matcher checks whether a match starting one (or two) bytes later is better. A match is
 //!   worth roughly four points per matched byte, minus the number of bits needed to encode its offset.
 //!
@@ -29,7 +30,7 @@
 //! Zstd specification places on dictionary references.
 
 use alloc::vec::Vec;
-use core::convert::TryInto;
+use core::convert::{TryFrom, TryInto};
 
 use super::blocks::encode_offset_value;
 use super::frame_compressor::INITIAL_OFFSET_HISTORY;
@@ -49,6 +50,12 @@ const SEARCH_STRENGTH: usize = 8;
 
 /// How many full blocks may accumulate on top of the window before the oldest data is dropped from the buffer.
 const SLACK_BLOCKS: usize = 4;
+
+/// How many positions ahead the row of a position is fetched into the cache ([`Strategy::Lazy`] with rows)
+const ROW_LOOKAHEAD: usize = 8;
+
+/// The smallest hash table that is split into rows: 16 rows of 16 entries
+const MIN_ROW_HASH_LOG: u32 = 8;
 
 /// Above this base the tables are cleared and positions start from the bottom again, so they never overflow
 const MAX_BASE: u32 = u32::MAX / 2;
@@ -90,7 +97,7 @@ impl MatcherParams {
                 window_log: 19,
                 hash_log: 14,
                 chain_log: 0,
-                min_match: 6,
+                min_match: 7,
                 search_depth: 1,
                 lazy_steps: 0,
             }),
@@ -109,7 +116,7 @@ impl MatcherParams {
                 hash_log: 19,
                 chain_log: 18,
                 min_match: LAZY_MIN_MATCH as u32,
-                search_depth: 32,
+                search_depth: 16,
                 lazy_steps: 2,
             }),
             CompressionLevel::Best => Some(Self {
@@ -137,6 +144,7 @@ impl MatcherParams {
         // Like the reference implementation, small inputs use shorter minimum matches with the greedy strategies
         match self.strategy {
             Strategy::Fast if size <= 16 * 1024 => self.min_match = 5,
+            Strategy::Fast if size <= 256 * 1024 => self.min_match = self.min_match.min(6),
             Strategy::DoubleFast if size <= 16 * 1024 => self.min_match = 4,
             _ => {}
         }
@@ -158,8 +166,16 @@ impl MatcherParams {
 
 /// Hash and chain tables. Separate from the data buffer so the two can be borrowed independently.
 struct Tables {
+    /// The hash table. With rows (see `row_log`) the positions of the rows, `1 << row_log` to a row.
     hash: Vec<u32>,
     chain: Vec<u32>,
+    /// log2 of the entries of a row of [`Strategy::Lazy`] without a dictionary, 0 with hash chains
+    row_log: u32,
+    /// A byte of the hash of each position in `hash`, to compare before the position is looked at. The first
+    /// byte of a row is not a tag but the entry written last (the first entry of a row is not used): entries
+    /// are written downwards, so the entries from there upwards (wrapping around) go from the most recent
+    /// position to the oldest.
+    tags: Vec<u8>,
     /// Record the slots written, see `restore`. Only set while a dictionary is in use.
     tracking: bool,
     /// The tables are the dictionary snapshot plus the slots in `touched_*`
@@ -174,6 +190,8 @@ impl Tables {
         Self {
             hash: Vec::new(),
             chain: Vec::new(),
+            row_log: 0,
+            tags: Vec::new(),
             tracking: false,
             dict_baseline: false,
             touched_hash: Vec::new(),
@@ -184,12 +202,19 @@ impl Tables {
 
     /// Give the tables the sizes of the parameters. Entries are kept if the size does not change: they are stale
     /// anyway once a new frame starts at a higher base.
-    fn resize(&mut self, params: &MatcherParams) {
+    fn resize(&mut self, params: &MatcherParams, row_log: u32) {
         let hash_len = 1usize << params.hash_log;
         let chain_len = match params.strategy {
             Strategy::Fast => 0,
+            Strategy::Lazy if row_log != 0 => 0,
             Strategy::DoubleFast | Strategy::Lazy => 1usize << params.chain_log,
         };
+        let tags_len = if row_log != 0 { hash_len } else { 0 };
+        if self.row_log != row_log || self.tags.len() != tags_len {
+            // Positions left by the other layout are below the base of the next frame, like any stale entry
+            self.row_log = row_log;
+            self.tags = alloc::vec![0; tags_len];
+        }
         if self.hash.len() != hash_len {
             self.hash = alloc::vec![0; hash_len];
             self.dict_baseline = false;
@@ -204,6 +229,7 @@ impl Tables {
     fn clear(&mut self) {
         self.hash.fill(0);
         self.chain.fill(0);
+        self.tags.fill(0);
         self.dict_baseline = false;
     }
 
@@ -278,6 +304,36 @@ impl Tables {
         self.dict_baseline = false;
         self.touched_hash.clear();
         self.touched_chain.clear();
+    }
+}
+
+/// The record of the slots written in a frame with a dictionary, see [`Tables::restore`]: the fields of
+/// [`Tables`] but the tables themselves, which the greedy matchers borrow as slices.
+struct Touched<'a> {
+    tracking: &'a mut bool,
+    dict_baseline: &'a mut bool,
+    touched_hash: &'a mut Vec<u32>,
+    touched_chain: &'a mut Vec<u32>,
+    touched_limit: usize,
+}
+
+impl Touched<'_> {
+    /// As [`Tables::touch`]
+    #[inline(never)]
+    fn touch(&mut self, slot: usize, hash: bool) {
+        if self.touched_hash.len() + self.touched_chain.len() >= self.touched_limit {
+            // Restoring the slots one by one would be more expensive than copying the whole tables
+            *self.tracking = false;
+            *self.dict_baseline = false;
+            self.touched_hash.clear();
+            self.touched_chain.clear();
+            return;
+        }
+        if hash {
+            self.touched_hash.push(slot as u32);
+        } else {
+            self.touched_chain.push(slot as u32);
+        }
     }
 }
 
@@ -385,7 +441,15 @@ impl WindowMatcher {
             Some(size) => self.level_params.for_size(size + dict_len as u64),
             None => self.level_params,
         };
-        self.tables.resize(&self.params);
+        // Rows of tagged positions are searched much faster than hash chains. Frames with a dictionary keep the
+        // chains, whose table state after the dictionary is cheap to restore for every frame.
+        let row_log = match self.params.strategy {
+            Strategy::Lazy if dict_len == 0 && self.params.hash_log >= MIN_ROW_HASH_LOG => {
+                self.params.search_depth.max(1).ilog2().clamp(4, 6)
+            }
+            _ => 0,
+        };
+        self.tables.resize(&self.params, row_log);
         self.capacity =
             self.params.window_size() + dict_len + SLACK_BLOCKS * MAX_BLOCK_SIZE as usize;
         if self.size_hint.is_none() {
@@ -564,7 +628,12 @@ impl WindowMatcher {
                 self.match_greedy::<true, true>(handle_sequence)
             }
             Strategy::DoubleFast => self.match_greedy::<true, false>(handle_sequence),
-            Strategy::Lazy => self.match_lazy(handle_sequence),
+            Strategy::Lazy => match self.tables.row_log {
+                0 => self.match_lazy(handle_sequence),
+                4 => self.match_lazy_rows::<16>(handle_sequence),
+                5 => self.match_lazy_rows::<32>(handle_sequence),
+                _ => self.match_lazy_rows::<64>(handle_sequence),
+            },
         }
     }
 
@@ -597,7 +666,36 @@ impl WindowMatcher {
         let low_abs = low as u32 + base;
         let params = self.params;
         let buf = self.buf.as_slice();
-        let tables = &mut self.tables;
+        // The tables as slices of their own: a write to one then says nothing about where the others are
+        let Tables {
+            hash,
+            chain,
+            tracking,
+            dict_baseline,
+            touched_hash,
+            touched_chain,
+            touched_limit,
+            ..
+        } = &mut self.tables;
+        let hash = hash.as_mut_slice();
+        let chain = chain.as_mut_slice();
+        let mut touched = Touched {
+            tracking,
+            dict_baseline,
+            touched_hash,
+            touched_chain,
+            touched_limit: *touched_limit,
+        };
+        // Sets a slot of a table, recording it in frames with a dictionary (`TRACK`)
+        macro_rules! set {
+            ($table:ident, $slot:expr, $value:expr) => {{
+                let slot = $slot;
+                $table[slot] = $value;
+                if TRACK && *touched.tracking {
+                    touched.touch(slot, stringify!($table) == "hash");
+                }
+            }};
+        }
         let mut rep = self.rep;
         // Last position at which a search can be started
         let ilimit = block_end - READ_SIZE;
@@ -625,14 +723,14 @@ impl WindowMatcher {
             let h_s = short.hash(v);
             let (cand_long, cand_short) = if DOUBLE {
                 let h_l = hash8(v, long_log);
-                let cand_long = tables.hash[h_l];
-                let cand_short = tables.chain[h_s];
-                tables.set_hash_t::<TRACK>(h_l, cur);
-                tables.set_chain_t::<TRACK>(h_s, cur);
+                let cand_long = hash[h_l];
+                let cand_short = chain[h_s];
+                set!(hash, h_l, cur);
+                set!(chain, h_s, cur);
                 (cand_long, cand_short)
             } else {
-                let cand = tables.hash[h_s];
-                tables.set_hash_t::<TRACK>(h_s, cur);
+                let cand = hash[h_s];
+                set!(hash, h_s, cur);
                 (0, cand)
             };
 
@@ -670,8 +768,8 @@ impl WindowMatcher {
                         let long_next = if DOUBLE {
                             let v1 = read_u64(buf, ip + 1);
                             let h_l1 = hash8(v1, long_log);
-                            let cand = tables.hash[h_l1];
-                            tables.set_hash_t::<TRACK>(h_l1, cur + 1);
+                            let cand = hash[h_l1];
+                            set!(hash, h_l1, cur + 1);
                             let m1 = (cand.wrapping_sub(base)) as usize;
                             if cand >= low_abs && read_u64(buf, m1) == v1 {
                                 Some((
@@ -717,21 +815,24 @@ impl WindowMatcher {
                 let fill = searched + 2;
                 if DOUBLE {
                     let v = read_u64(buf, fill);
-                    tables.set_hash_t::<TRACK>(hash8(v, long_log), fill as u32 + base);
-                    tables.set_chain_t::<TRACK>(short.hash(v), fill as u32 + base);
-                    tables.set_hash_t::<TRACK>(
+                    set!(hash, hash8(v, long_log), fill as u32 + base);
+                    set!(chain, short.hash(v), fill as u32 + base);
+                    set!(
+                        hash,
                         hash8(read_u64(buf, ip - 2), long_log),
-                        (ip - 2) as u32 + base,
+                        (ip - 2) as u32 + base
                     );
-                    tables.set_chain_t::<TRACK>(
+                    set!(
+                        chain,
                         short.hash(read_u64(buf, ip - 1)),
-                        (ip - 1) as u32 + base,
+                        (ip - 1) as u32 + base
                     );
                 } else {
-                    tables.set_hash_t::<TRACK>(short.hash(read_u64(buf, fill)), fill as u32 + base);
-                    tables.set_hash_t::<TRACK>(
+                    set!(hash, short.hash(read_u64(buf, fill)), fill as u32 + base);
+                    set!(
+                        hash,
                         short.hash(read_u64(buf, ip - 2)),
-                        (ip - 2) as u32 + base,
+                        (ip - 2) as u32 + base
                     );
                 }
 
@@ -744,10 +845,10 @@ impl WindowMatcher {
                     let len = 4 + common_prefix_len(buf, ip - r2 + 4, ip + 4, block_end);
                     let v = read_u64(buf, ip);
                     if DOUBLE {
-                        tables.set_hash_t::<TRACK>(hash8(v, long_log), ip as u32 + base);
-                        tables.set_chain_t::<TRACK>(short.hash(v), ip as u32 + base);
+                        set!(hash, hash8(v, long_log), ip as u32 + base);
+                        set!(chain, short.hash(v), ip as u32 + base);
                     } else {
-                        tables.set_hash_t::<TRACK>(short.hash(v), ip as u32 + base);
+                        set!(hash, short.hash(v), ip as u32 + base);
                     }
                     encode_offset_value(r2 as u32, 0, &mut rep);
                     handle_sequence(Sequence::Triple {
@@ -941,6 +1042,217 @@ impl WindowMatcher {
             });
         }
     }
+
+    /// [`Strategy::Lazy`] over rows of `ROW` tagged positions (16, 32 or 64): the lazy matching of
+    /// [`Self::match_lazy`], which keeps the same positions in hash chains for frames with a dictionary.
+    ///
+    /// A hash of the five bytes at a position picks its row (the upper bits) and its tag (the lowest byte). The
+    /// first byte of a row of tags is not a tag but the entry written last, and the first entry of a row is not
+    /// used: entries are written downwards, so the entries from the last one written upwards (wrapping around) go
+    /// from the most recent position to the oldest.
+    fn match_lazy_rows<const ROW: usize>(
+        &mut self,
+        mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        let block_start = self.block_start;
+        let block_end = self.buf.len();
+        if block_end - block_start < LAZY_MIN_MATCH {
+            if block_end > block_start {
+                handle_sequence(Sequence::Literals {
+                    literals: &self.buf[block_start..],
+                });
+            }
+            return;
+        }
+        // Rows are not used with a dictionary: every match starts in the frame
+        let src_floor = self.frame_base;
+        let base = self.base;
+        let window_size = self.params.window_size();
+        let depth = (self.params.search_depth as usize).min(ROW);
+        let lazy_steps = self.params.lazy_steps as usize;
+        let hash_bits = self.params.hash_log - ROW.ilog2() + 8;
+        let buf = self.buf.as_slice();
+        // The tables as slices of their own: a write to a tag then says nothing about where the tables are
+        let tags = self.tables.tags.as_mut_slice();
+        let positions = self.tables.hash.as_mut_slice();
+        let mut rep = self.rep;
+        // Positions of skipped blocks that were dropped from the buffer can not be inserted anymore
+        let mut next_to_update = u32::max(self.next_to_update, base);
+        // Last position at which a search can be started
+        let ilimit = block_end - LAZY_MIN_MATCH;
+
+        // The hashes of the next positions to insert, so that their rows can be fetched into the cache ahead of
+        // time: the rows are spread over tables larger than the caches of the processor, and waiting for a row at
+        // every position costs more than everything else the search does.
+        let mut hashes = [0u32; ROW_LOOKAHEAD];
+        {
+            let first = (next_to_update - base) as usize;
+            for pos in first..usize::min(first + ROW_LOOKAHEAD, ilimit + 1) {
+                hashes[pos % ROW_LOOKAHEAD] = hash_lazy(buf, pos, hash_bits) as u32;
+            }
+        }
+
+        // Searches the repeat offsets and the row of `ip` for the most valuable match at `ip`, after inserting
+        // the positions before `ip`, and inserts `ip`. Returns the length, offset and value (see `score`) of the
+        // match; the length is 0 if none was found.
+        let mut search = |rep: &[u32; 3], ip: usize| -> (usize, usize, i64) {
+            let cur = ip as u32 + base;
+            while next_to_update < cur {
+                let pos = (next_to_update - base) as usize;
+                let h =
+                    next_row_hash::<ROW>(buf, tags, positions, &mut hashes, pos, ilimit, hash_bits);
+                insert_in_row::<ROW>(tags, positions, h, next_to_update);
+                next_to_update += 1;
+            }
+            next_to_update = cur + 1;
+            let h = next_row_hash::<ROW>(buf, tags, positions, &mut hashes, ip, ilimit, hash_bits);
+
+            let low_limit = usize::max(ip.saturating_sub(window_size), src_floor);
+            let low_abs = low_limit as u32 + base;
+            let mut best_len = 0;
+            let mut best_offset = 0;
+            let mut best_score = i64::MIN;
+            // A match is at least five bytes: most candidates differ in the first four, which one comparison tells
+            let first_bytes = read_u32(buf, ip);
+            for &offset in rep {
+                let offset = offset as usize;
+                if offset > ip || ip - offset < low_limit || offset == best_offset {
+                    continue;
+                }
+                if read_u32(buf, ip - offset) != first_bytes {
+                    continue;
+                }
+                let len = common_prefix_len(buf, ip - offset, ip, block_end);
+                if len >= LAZY_MIN_MATCH && score_rep(len) > best_score {
+                    best_len = len;
+                    best_offset = offset;
+                    best_score = score_rep(len);
+                }
+            }
+            if ip + best_len < block_end {
+                let first = (h >> 8) * ROW;
+                let (Some(row_tags), Some(row)) = (
+                    tags.get(first..first + ROW)
+                        .and_then(|row| <&[u8; ROW]>::try_from(row).ok()),
+                    positions
+                        .get(first..first + ROW)
+                        .and_then(|row| <&[u32; ROW]>::try_from(row).ok()),
+                ) else {
+                    unreachable!("the tables hold every row of the hash");
+                };
+                let head = row_tags[0] as usize % ROW;
+                // The entries with the tag of this position (but the first, which is no entry), the most recent
+                // in the lowest bit
+                let mut found = tag_matches(row_tags, h as u8) & !1;
+                found = if ROW < 64 {
+                    ((found >> head) | (found << (ROW - head))) & ((1u64 << ROW) - 1)
+                } else {
+                    found.rotate_right(head as u32)
+                };
+                // The bytes of the candidates are fetched into the cache before any is compared, so that the waits
+                // for them overlap instead of following one another
+                let mut count = 0;
+                let mut ahead = found;
+                while ahead != 0 && count < depth {
+                    let candidate = row[(head + ahead.trailing_zeros() as usize) % ROW];
+                    if candidate < low_abs || candidate >= cur {
+                        // Older entries are further away still
+                        break;
+                    }
+                    ahead &= ahead - 1;
+                    prefetch(buf, (candidate - base) as usize);
+                    count += 1;
+                }
+                for _ in 0..count {
+                    let candidate = row[(head + found.trailing_zeros() as usize) % ROW];
+                    found &= found - 1;
+                    let cand = (candidate - base) as usize;
+                    if read_u32(buf, cand) == first_bytes
+                        && buf[cand + best_len] == buf[ip + best_len]
+                    {
+                        let len = common_prefix_len(buf, cand, ip, block_end);
+                        let offset = ip - cand;
+                        let value = if rep.contains(&(offset as u32)) {
+                            score_rep(len)
+                        } else {
+                            score(len, offset)
+                        };
+                        if len >= LAZY_MIN_MATCH && value > best_score {
+                            best_len = len;
+                            best_offset = offset;
+                            best_score = value;
+                            if ip + len == block_end {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            insert_in_row::<ROW>(tags, positions, h, cur);
+            (best_len, best_offset, best_score)
+        };
+
+        let mut ip = block_start;
+        let mut anchor = block_start;
+
+        while ip <= ilimit {
+            let (mut match_len, mut offset, mut value) = search(&rep, ip);
+            let mut start = ip;
+            if match_len < LAZY_MIN_MATCH {
+                // Nothing found, skip faster the longer we did not find anything
+                ip += ((ip - anchor) >> SEARCH_STRENGTH) + 1;
+                continue;
+            }
+
+            // Lazy evaluation: is a match starting a little later a better choice?
+            let mut lazy_step = 0;
+            while lazy_step < lazy_steps && ip < ilimit {
+                ip += 1;
+                let (len2, offset2, value2) = search(&rep, ip);
+                if len2 >= LAZY_MIN_MATCH {
+                    // The further we already moved away from `start` the more the new match has to gain
+                    let gain1 = value + 4 + 3 * lazy_step as i64;
+                    if value2 > gain1 {
+                        match_len = len2;
+                        offset = offset2;
+                        value = value2;
+                        start = ip;
+                        lazy_step = 0;
+                        continue;
+                    }
+                }
+                lazy_step += 1;
+            }
+
+            // Catch up: the match might extend backwards into the literals
+            while start > anchor
+                && start > offset + src_floor
+                && buf[start - 1] == buf[start - 1 - offset]
+            {
+                start -= 1;
+                match_len += 1;
+            }
+
+            // Track the history the encoder will have, so the next searches know the repeat offsets
+            encode_offset_value(offset as u32, (start - anchor) as u32, &mut rep);
+            handle_sequence(Sequence::Triple {
+                literals: &buf[anchor..start],
+                offset,
+                match_len,
+            });
+
+            ip = start + match_len;
+            anchor = ip;
+        }
+
+        self.rep = rep;
+        self.next_to_update = next_to_update;
+        if anchor < block_end {
+            handle_sequence(Sequence::Literals {
+                literals: &buf[anchor..block_end],
+            });
+        }
+    }
 }
 
 /// Hash of the first `min_match` bytes of a little endian `u64`
@@ -978,6 +1290,95 @@ impl ShortHash {
 #[inline(always)]
 fn hash8(v: u64, hash_log: u32) -> usize {
     (v.wrapping_mul(0xCF1B_BCDC_B7A5_6463) >> (64 - hash_log)) as usize
+}
+
+/// The hash of `pos` ([`WindowMatcher::match_lazy_rows`]), which is the position after the last one asked for:
+/// the hash was computed [`ROW_LOOKAHEAD`] positions ago, when its row was fetched into the cache, as the row of
+/// the position that far ahead is now.
+#[inline(always)]
+fn next_row_hash<const ROW: usize>(
+    buf: &[u8],
+    tags: &[u8],
+    positions: &[u32],
+    hashes: &mut [u32; ROW_LOOKAHEAD],
+    pos: usize,
+    ilimit: usize,
+    hash_bits: u32,
+) -> usize {
+    let slot = pos % ROW_LOOKAHEAD;
+    let h = hashes[slot] as usize;
+    let ahead = pos + ROW_LOOKAHEAD;
+    if ahead <= ilimit {
+        let next = hash_lazy(buf, ahead, hash_bits);
+        hashes[slot] = next as u32;
+        // The tags of a row are in one cache line, its positions in one line for every 16
+        let first = (next >> 8) * ROW;
+        prefetch(tags, first);
+        for line in 0..ROW / 16 {
+            prefetch(positions, first + 16 * line);
+        }
+    }
+    h
+}
+
+/// Writes a position to its row of `ROW` entries, before the entry written last.
+#[inline(always)]
+fn insert_in_row<const ROW: usize>(tags: &mut [u8], positions: &mut [u32], h: usize, abs: u32) {
+    let first = (h >> 8) * ROW;
+    let (Some(row_tags), Some(row)) = (
+        tags.get_mut(first..first + ROW),
+        positions.get_mut(first..first + ROW),
+    ) else {
+        return;
+    };
+    let mut head = (row_tags[0] as usize).wrapping_sub(1) % ROW;
+    if head == 0 {
+        head = ROW - 1;
+    }
+    row_tags[0] = head as u8;
+    row_tags[head] = h as u8;
+    row[head] = abs;
+}
+
+/// Asks the processor to fetch the cache line of `slice[index]`, which is about to be read.
+///
+/// Only where the standard library has a stable instruction for it. Elsewhere the element is read instead, which
+/// has the same effect as long as the processor runs ahead of the read.
+#[inline(always)]
+fn prefetch<T: Copy>(slice: &[T], index: usize) {
+    if let Some(item) = slice.get(index) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            // SAFETY: a prefetch reads no memory, and the pointer is that of an element of the slice.
+            #[allow(unused_unsafe)]
+            unsafe {
+                _mm_prefetch::<_MM_HINT_T0>(core::ptr::from_ref(item).cast::<i8>())
+            };
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            core::hint::black_box(*item);
+        }
+    }
+}
+
+/// The entries of a row (16, 32 or 64 tags) equal to `tag`, as a bit each: the lowest bit is the first entry.
+///
+/// Eight tags are compared at once in a `u64`: a byte of `x` is zero where the tags are equal, and the usual
+/// zero-byte test (exact, without the carries of the shorter one) sets the high bit of those bytes, which a
+/// multiplication gathers into one byte.
+#[inline(always)]
+fn tag_matches<const ROW: usize>(tags: &[u8; ROW], tag: u8) -> u64 {
+    const LOW7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    let pattern = u64::from(tag) * 0x0101_0101_0101_0101;
+    let mut matches = 0;
+    for (i, chunk) in tags.chunks_exact(8).enumerate() {
+        let x = u64::from_le_bytes(chunk.try_into().unwrap()) ^ pattern;
+        let zero = !(((x & LOW7) + LOW7) | x | LOW7);
+        matches |= ((zero >> 7).wrapping_mul(0x0102_0408_1020_4080) >> 56) << (8 * i);
+    }
+    matches
 }
 
 /// Hash of the 5 bytes at `pos`, used by the hash chains
@@ -1282,7 +1683,10 @@ mod tests {
             matcher.base = MAX_BASE - 1000;
             let sequences = roundtrip(&mut matcher, params, &data, None, false);
             assert!(matcher.base < 1000);
-            assert!(sequences >= 1);
+            // Rows keep `1 << hash_log` positions in all: the small ones have forgotten the first half by then
+            let remembered =
+                matcher.tables.row_log == 0 || (1usize << params.hash_log) > 2 * 20_000;
+            assert!(sequences >= 1 || !remembered);
             // A shift of the window crosses the limit in the middle of a frame
             matcher.reset(params);
             matcher.base = MAX_BASE - 10;

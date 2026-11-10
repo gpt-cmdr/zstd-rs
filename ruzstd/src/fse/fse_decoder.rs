@@ -94,6 +94,11 @@ impl FSETable {
         }
     }
 
+    /// Sets the largest symbol the table may hold.
+    pub(crate) fn set_max_symbol(&mut self, max_symbol: u8) {
+        self.max_symbol = max_symbol;
+    }
+
     /// Reset `self` and update `self`'s state to mirror the provided table.
     pub fn reinit_from(&mut self, other: &Self) {
         self.reset();
@@ -197,21 +202,26 @@ impl FSETable {
         }
 
         // baselines and num_bits can only be calculated when all symbols have been spread
+        //
+        // The states of a symbol of probability `prob`, in the order of the table, are numbered from
+        // `prob` to `2 * prob - 1`. The state numbered `x` reads as many bits as it takes to make
+        // `x` at least the size of the table, and its baseline is what `x` is over the size then:
+        // the lower numbers read a bit more, and between them the states of a symbol cover every
+        // state of the table once. (As `calc_baseline_and_numbits`, which the tests compare.)
         self.symbol_counter.clear();
-        self.symbol_counter
-            .resize(self.symbol_probabilities.len(), 0);
+        self.symbol_counter.extend(
+            self.symbol_probabilities
+                .iter()
+                .map(|&prob| prob.max(0) as u32),
+        );
+        let accuracy_log = u32::from(self.accuracy_log);
         for idx in 0..negative_idx {
             let entry = &mut self.decode[idx];
             let symbol = entry.symbol;
-            let prob = self.symbol_probabilities[symbol as usize];
-
-            let symbol_count = self.symbol_counter[symbol as usize];
-            let (bl, nb) = calc_baseline_and_numbits(table_size as u32, prob as u32, symbol_count);
-
-            //println!("symbol: {:2}, table: {}, prob: {:3}, count: {:3}, bl: {:3}, nb: {:2}", symbol, table_size, prob, symbol_count, bl, nb);
-
-            assert!(nb <= self.accuracy_log);
+            let x = self.symbol_counter[symbol as usize];
             self.symbol_counter[symbol as usize] += 1;
+            let nb = (accuracy_log - x.ilog2()) as u8;
+            let bl = (x << nb) - table_size as u32;
 
             entry.base_line = bl;
             entry.num_bits = nb;
@@ -328,6 +338,28 @@ fn highest_bit_set(x: u32) -> u32 {
     u32::BITS - x.leading_zeros()
 }
 
+#[cfg(test)]
+#[test]
+fn states_have_the_baselines_and_bits_of_their_number() {
+    for log in 1..=9u32 {
+        let size = 1u32 << log;
+        for prob in 1..=size {
+            for state in 0..prob {
+                let x = prob + state;
+                let nb = (log - x.ilog2()) as u8;
+                assert_eq!(
+                    ((x << nb) - size, nb),
+                    calc_baseline_and_numbits(size, prob, state),
+                    "table {} probability {} state {}",
+                    size,
+                    prob,
+                    state
+                );
+            }
+        }
+    }
+}
+
 //utility functions for building the decoding table from probabilities
 /// Calculate the position of the next entry of the table given the current
 /// position and size of the table.
@@ -337,6 +369,7 @@ fn next_position(mut p: usize, table_size: usize) -> usize {
     p
 }
 
+#[cfg(test)]
 fn calc_baseline_and_numbits(
     num_states_total: u32,
     num_states_symbol: u32,

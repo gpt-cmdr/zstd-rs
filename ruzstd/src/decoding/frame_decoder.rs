@@ -7,6 +7,7 @@
 use super::frame;
 use crate::decoding;
 use crate::decoding::dictionary::Dictionary;
+use crate::decoding::direct::{DirectError, DirectScratch};
 use crate::decoding::errors::FrameDecoderError;
 use crate::decoding::scratch::DecoderScratch;
 use crate::io::{Error, Read, Write};
@@ -81,6 +82,10 @@ pub struct FrameDecoder {
     state: Option<FrameDecoderState>,
     dicts: BTreeMap<u32, Dictionary>,
     max_window_size: u64,
+    /// The tables and buffers of [`FrameDecoder::decode_all`], allocated at its first call.
+    direct: Option<alloc::boxed::Box<DirectScratch>>,
+    /// Whether the last frame was decoded by [`FrameDecoder::decode_all`] without `state`.
+    last_frame_direct: bool,
 }
 
 struct FrameDecoderState {
@@ -160,6 +165,8 @@ impl FrameDecoder {
             state: None,
             dicts: BTreeMap::new(),
             max_window_size: DEFAULT_MAX_WINDOW_SIZE,
+            direct: None,
+            last_frame_direct: false,
         }
     }
 
@@ -199,6 +206,7 @@ impl FrameDecoder {
     /// equivalent to init()
     pub fn reset(&mut self, source: impl Read) -> Result<(), FrameDecoderError> {
         use FrameDecoderError as err;
+        self.last_frame_direct = false;
         let state = match &mut self.state {
             Some(s) => {
                 s.reset(source, self.max_window_size)?;
@@ -252,6 +260,9 @@ impl FrameDecoder {
 
     /// Returns the checksum that was read from the data. Only available after all bytes have been read. It is the last 4 bytes of a zstd-frame
     pub fn get_checksum_from_data(&self) -> Option<u32> {
+        if let Some(checksum) = self.direct_checksum() {
+            return Some(checksum.from_data);
+        }
         let state = self.state.as_ref()?;
 
         state.check_sum
@@ -263,10 +274,23 @@ impl FrameDecoder {
     pub fn get_calculated_checksum(&self) -> Option<u32> {
         use core::hash::Hasher;
 
+        if let Some(checksum) = self.direct_checksum() {
+            return checksum.calculated;
+        }
         let state = self.state.as_ref()?;
         let cksum_64bit = state.decoder_scratch.buffer.hash.finish();
         //truncate to lower 32bit because reasons...
         Some(cksum_64bit as u32)
+    }
+
+    /// The checksum of the last frame, when [`FrameDecoder::decode_all`] decoded it without the state of
+    /// the streaming decoder.
+    fn direct_checksum(&self) -> Option<crate::decoding::direct::FrameChecksum> {
+        if self.last_frame_direct {
+            self.direct.as_ref()?.checksum
+        } else {
+            None
+        }
     }
 
     /// Counter for how many bytes have been consumed while decoding the frame
@@ -535,7 +559,13 @@ impl FrameDecoder {
     /// `output` must be large enough to hold the decompressed data. If you don't know
     /// how large the output will be, use [`FrameDecoder::decode_blocks`] instead.
     ///
-    /// This calls [`FrameDecoder::init`], and all bytes currently in the decoder will be lost.
+    /// All bytes currently in the decoder are lost. Afterwards the decoder holds no frame: of the
+    /// accessors only [`FrameDecoder::get_checksum_from_data`] and
+    /// [`FrameDecoder::get_calculated_checksum`] tell of the last frame decoded (the others do
+    /// too after a frame with a dictionary, which is decoded as a stream). With the `hash`
+    /// feature, content without the checksum its frame ends with is a
+    /// [`FrameDecoderError::ChecksumMismatch`]. Bytes of `output` after the decoded ones may be
+    /// written to.
     ///
     /// Returns the number of bytes written to `output`.
     pub fn decode_all(
@@ -545,18 +575,37 @@ impl FrameDecoder {
     ) -> Result<usize, FrameDecoderError> {
         let mut total_bytes_written = 0;
         while !input.is_empty() {
-            match self.init(&mut input) {
-                Ok(_) => {}
-                Err(FrameDecoderError::ReadFrameHeaderError(
+            // A frame is decoded straight into `output`, which is then its own window. Frames
+            // with a dictionary go through the window buffer of the streaming decoder below,
+            // which holds the content of the dictionary.
+            let max_window_size = self.max_window_size;
+            let direct = self
+                .direct
+                .get_or_insert_with(|| alloc::boxed::Box::new(DirectScratch::new()));
+            match direct.decode_frame(input, output, max_window_size) {
+                Ok((read, written)) => {
+                    // What an earlier frame left in the streaming decoder is lost, as it was
+                    // when every frame started with `init`
+                    self.state = None;
+                    self.last_frame_direct = true;
+                    input = &input[read..];
+                    output = &mut output[written..];
+                    total_bytes_written += written;
+                    continue;
+                }
+                Err(DirectError::Failed(FrameDecoderError::ReadFrameHeaderError(
                     crate::decoding::errors::ReadFrameHeaderError::SkipFrame { length, .. },
-                )) => {
-                    input = input
-                        .get(length as usize..)
+                ))) => {
+                    input = (length as usize)
+                        .checked_add(8)
+                        .and_then(|skip| input.get(skip..))
                         .ok_or(FrameDecoderError::FailedToSkipFrame)?;
                     continue;
                 }
-                Err(e) => return Err(e),
-            };
+                Err(DirectError::Failed(e)) => return Err(e),
+                Err(DirectError::Unsupported) => {}
+            }
+            self.init(&mut input)?;
             loop {
                 self.decode_blocks(&mut input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
                 let bytes_written = self
@@ -569,6 +618,19 @@ impl FrameDecoder {
                 }
                 if self.is_finished() {
                     break;
+                }
+            }
+            // The checksum of a frame with a dictionary, as of the frames decoded above
+            #[cfg(feature = "hash")]
+            if let (Some(expected), Some(calculated)) = (
+                self.get_checksum_from_data(),
+                self.get_calculated_checksum(),
+            ) {
+                if expected != calculated {
+                    return Err(FrameDecoderError::ChecksumMismatch {
+                        expected,
+                        calculated,
+                    });
                 }
             }
         }

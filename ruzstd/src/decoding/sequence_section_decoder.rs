@@ -410,34 +410,34 @@ fn maybe_update_fse_tables(
 }
 
 // The default Literal Length decoding table uses an accuracy logarithm of 6 bits.
-const LL_DEFAULT_ACC_LOG: u8 = 6;
+pub(crate) const LL_DEFAULT_ACC_LOG: u8 = 6;
 /// If [ModeType::Predefined] is selected for a symbol type, its FSE decoding
 /// table is generated using a predefined distribution table.
 ///
 /// https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#literals-length
-const LITERALS_LENGTH_DEFAULT_DISTRIBUTION: [i32; 36] = [
+pub(crate) const LITERALS_LENGTH_DEFAULT_DISTRIBUTION: [i32; 36] = [
     4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
     -1, -1, -1, -1,
 ];
 
 // The default Match Length decoding table uses an accuracy logarithm of 6 bits.
-const ML_DEFAULT_ACC_LOG: u8 = 6;
+pub(crate) const ML_DEFAULT_ACC_LOG: u8 = 6;
 /// If [ModeType::Predefined] is selected for a symbol type, its FSE decoding
 /// table is generated using a predefined distribution table.
 ///
 /// https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#match-length
-const MATCH_LENGTH_DEFAULT_DISTRIBUTION: [i32; 53] = [
+pub(crate) const MATCH_LENGTH_DEFAULT_DISTRIBUTION: [i32; 53] = [
     1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1,
 ];
 
 // The default Match Length decoding table uses an accuracy logarithm of 5 bits.
-const OF_DEFAULT_ACC_LOG: u8 = 5;
+pub(crate) const OF_DEFAULT_ACC_LOG: u8 = 5;
 /// If [ModeType::Predefined] is selected for a symbol type, its FSE decoding
 /// table is generated using a predefined distribution table.
 ///
 /// https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#match-length
-const OFFSET_DEFAULT_DISTRIBUTION: [i32; 29] = [
+pub(crate) const OFFSET_DEFAULT_DISTRIBUTION: [i32; 29] = [
     1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
 ];
 

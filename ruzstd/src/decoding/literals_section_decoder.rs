@@ -3,9 +3,7 @@
 
 use super::super::blocks::literals_section::{LiteralsSection, LiteralsSectionType};
 use super::scratch::HuffmanScratch;
-use crate::bit_io::BitReaderReversed;
 use crate::decoding::errors::DecompressLiteralsError;
-use crate::huff0::HuffmanDecoder;
 use alloc::vec::Vec;
 
 /// Decode and decompress the provided literals section into `target`, returning the number of bytes read.
@@ -86,63 +84,34 @@ fn decompress_literals(
         }
 
         //decode 4 streams
-        let stream1 = &source[..jump1];
-        let stream2 = &source[jump1..jump2];
-        let stream3 = &source[jump2..jump3];
-        let stream4 = &source[jump3..];
-
-        for stream in &[stream1, stream2, stream3, stream4] {
-            let mut decoder = HuffmanDecoder::new(&scratch.table);
-            let mut br = BitReaderReversed::new(stream);
-            //skip the 0 padding at the end of the last byte of the bit stream and throw away the first 1 found
-            let mut skipped_bits = 0;
-            loop {
-                let val = br.get_bits(1);
-                skipped_bits += 1;
-                if val == 1 || skipped_bits > 8 {
-                    break;
-                }
-            }
-            if skipped_bits > 8 {
-                //if more than 7 bits are 0, this is not the correct end of the bitstream. Either a bug or corrupted data
-                return Err(DecompressLiteralsError::ExtraPadding { skipped_bits });
-            }
-            decoder.init_state(&mut br);
-
-            while br.bits_remaining() > -(scratch.table.max_num_bits as isize) {
-                target.push(decoder.decode_symbol());
-                decoder.next_state(&mut br);
-            }
-            if br.bits_remaining() != -(scratch.table.max_num_bits as isize) {
-                return Err(DecompressLiteralsError::BitstreamReadMismatch {
-                    read_til: br.bits_remaining(),
-                    expected: -(scratch.table.max_num_bits as isize),
-                });
-            }
+        let streams = [
+            &source[..jump1],
+            &source[jump1..jump2],
+            &source[jump2..jump3],
+            &source[jump3..],
+        ];
+        let start = target.len();
+        target.resize(start + section.regenerated_size as usize, 0);
+        if scratch
+            .table
+            .decode_four_streams(streams, &mut target[start..])
+            .is_none()
+        {
+            return Err(literals_mismatch(section));
         }
 
         bytes_read += source.len() as u32;
     } else {
         //just decode the one stream
         assert!(num_streams == 1);
-        let mut decoder = HuffmanDecoder::new(&scratch.table);
-        let mut br = BitReaderReversed::new(source);
-        let mut skipped_bits = 0;
-        loop {
-            let val = br.get_bits(1);
-            skipped_bits += 1;
-            if val == 1 || skipped_bits > 8 {
-                break;
-            }
-        }
-        if skipped_bits > 8 {
-            //if more than 7 bits are 0, this is not the correct end of the bitstream. Either a bug or corrupted data
-            return Err(DecompressLiteralsError::ExtraPadding { skipped_bits });
-        }
-        decoder.init_state(&mut br);
-        while br.bits_remaining() > -(scratch.table.max_num_bits as isize) {
-            target.push(decoder.decode_symbol());
-            decoder.next_state(&mut br);
+        let start = target.len();
+        target.resize(start + section.regenerated_size as usize, 0);
+        if scratch
+            .table
+            .decode_stream(source, &mut target[start..])
+            .is_none()
+        {
+            return Err(literals_mismatch(section));
         }
         bytes_read += source.len() as u32;
     }
@@ -155,4 +124,12 @@ fn decompress_literals(
     }
 
     Ok(bytes_read)
+}
+
+/// The error of Huffman streams that do not decode to exactly the literals of their section.
+fn literals_mismatch(section: &LiteralsSection) -> DecompressLiteralsError {
+    DecompressLiteralsError::DecodedLiteralCountMismatch {
+        decoded: 0,
+        expected: section.regenerated_size as usize,
+    }
 }

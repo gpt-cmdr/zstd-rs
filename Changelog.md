@@ -2,6 +2,39 @@
 
 This document records the changes made between versions, starting with version 0.5.0
 
+# Unreleased
+
+Speed, measured against the zstd C library (1.5.7, through the `zstd` crate) on 1 MiB chunks of rasters (USGS
+elevation as Float32, SRTM as Int16, Landsat as 4 x UInt8, each with and without the TIFF predictor), a frame per
+chunk, on an x86-64 desktop. `cargo run --release --example rasterbench` reproduces the comparison on any files.
+
+* Decoding whole frames (`FrameDecoder::decode_all`) took 1.5 to 5.2 times as long as the C library and now takes
+  0.99 to 1.25 times as long. Frames without a dictionary are decoded straight into the output slice, which is its
+  own window, instead of into the window ring buffer and out of it: blocks are read in place, sequences are
+  executed as they are decoded, from tables that hold the base value and extra bits of each state, and the
+  bitstream is refilled at most twice per sequence. The bytes of the output after those of the frames may be
+  written to.
+* Huffman-coded literals are decoded four streams side by side through an 11-bit table, five lookups per refill,
+  and two symbols per lookup where the literals compress well. The streaming decoder uses the same decoding (it
+  still takes 1.5 to 4.6 times as long as the C library, for its window buffer)
+* `decode_all` with the `hash` feature compares the checksum a frame ends with to that of the content decoded:
+  `FrameDecoderError::ChecksumMismatch` when they differ. The streaming decoder reports both and leaves the
+  comparison to the caller, as before
+* New `decoding::content_size`: the size the headers of whole frames record, to size the output of `decode_all`
+* The lazy strategy (`Better`, `Best`) without a dictionary keeps the positions of a hash in rows of 16 to 64 with
+  a byte of the hash each, as the reference implementation's row match finder does, instead of hash chains. Rows
+  are fetched into the cache eight positions ahead and candidates before they are compared. `Better` took 2.8 to
+  7.4 times as long as level 9 of the C library, to the same sizes, and now takes 1.2 to 1.7 times as long. It
+  looks at 16 candidates per search, as level 9 does (it looked at 32). `Best` compresses 3 to 8 times faster than
+  before; frames with a dictionary keep the hash chains
+* `Fastest` hashes 7-byte prefixes for data over 256 KiB and 6-byte ones below, as level 1 of the reference
+  implementation: its frames were up to 3% smaller than level 1's and are now within 1%, and it takes 1.3 to 1.5
+  times as long as level 1 (it took 1.5 to 2.3 times as long). `Default` takes 1.25 to 1.5 times as long as level 3
+  (1.05 to 1.8 before)
+* New `encoding::Compressor`: compresses whole buffers to frames that state their content size and carry no
+  checksum (as `ZSTD_compress`), with tables allocated once instead of for every call
+* A content size of 4 GiB or more was written with the wrong field size flag
+
 # zstd-rust 0.1.0
 
 First release under the name `zstd-rust` (library name `zstd_rust`), an independently maintained fork of `ruzstd`,

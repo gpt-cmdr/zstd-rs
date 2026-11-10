@@ -46,3 +46,8 @@ rustc-dep-of-std = ["dep:core", "dep:alloc"]
 [[bench]]
 name = "decode_all"
 harness = false
+
+# Compares with the zstd C library (a dev-dependency) through `std::io`.
+[[example]]
+name = "rasterbench"
+required-features = ["std"]

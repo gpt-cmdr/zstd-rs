@@ -89,25 +89,13 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         writer: &mut BitWriter<VV>,
         data: &[u8],
     ) {
-        let codes = table.codes.as_slice();
-        writer.flush_full_bytes();
-        // Symbols are written from the last to the first. Codes have at most 11 bits, so four of them fit next to
-        // the at most 7 bits left over by a flush.
-        let (head, body) = data.split_at(data.len() % 4);
-        for chunk in body.rchunks_exact(4) {
-            for symbol in chunk.iter().rev() {
-                let (code, num_bits) = codes[*symbol as usize];
-                debug_assert!(num_bits > 0);
-                writer.add_bits(u64::from(code), num_bits as usize);
-            }
-            writer.flush_full_bytes();
+        // Each code with its number of bits, in sixteen bits (a code has at most eleven)
+        let mut codes = [0u16; 256];
+        for (packed, &(code, num_bits)) in codes.iter_mut().zip(&table.codes) {
+            debug_assert!(num_bits <= 11 && code >> num_bits == 0);
+            *packed = ((code as u16) << 4) | u16::from(num_bits);
         }
-        for symbol in head.iter().rev() {
-            let (code, num_bits) = codes[*symbol as usize];
-            debug_assert!(num_bits > 0);
-            writer.add_bits(u64::from(code), num_bits as usize);
-        }
-        writer.flush_full_bytes();
+        writer.add_codes_reversed(data, &codes);
 
         let bits_to_fill = writer.misaligned();
         if bits_to_fill == 0 {
@@ -169,14 +157,29 @@ pub struct HuffmanTable {
 
 impl HuffmanTable {
     pub fn build_from_data(data: &[u8]) -> Self {
-        let mut counts = [0; 256];
+        // Four tables, a byte in four counted in each: counting a symbol again right away then does not wait
+        // for the count just written
+        let mut parts = [[0u32; 256]; 4];
+        let mut chunks = data.chunks_exact(4);
+        for chunk in &mut chunks {
+            parts[0][chunk[0] as usize] += 1;
+            parts[1][chunk[1] as usize] += 1;
+            parts[2][chunk[2] as usize] += 1;
+            parts[3][chunk[3] as usize] += 1;
+        }
+        for x in chunks.remainder() {
+            parts[0][*x as usize] += 1;
+        }
+        let mut counts = [0usize; 256];
         let mut max = 0;
-        for x in data {
-            counts[*x as usize] += 1;
-            max = max.max(*x);
+        for (symbol, count) in counts.iter_mut().enumerate() {
+            *count = parts.iter().map(|part| part[symbol] as usize).sum();
+            if *count != 0 {
+                max = symbol;
+            }
         }
 
-        Self::build_from_counts(&counts[..=max as usize])
+        Self::build_from_counts(&counts[..=max])
     }
 
     /// Build an optimal prefix code for symbols with the given counts, limited to the maximum code length of the

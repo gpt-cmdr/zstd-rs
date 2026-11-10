@@ -479,7 +479,10 @@ impl From<HuffmanTableError> for DictionaryDecodeError {
 pub enum FrameDecoderError {
     ReadFrameHeaderError(ReadFrameHeaderError),
     FrameHeaderError(FrameHeaderError),
-    WindowSizeTooBig { requested: u64, max: u64 },
+    WindowSizeTooBig {
+        requested: u64,
+        max: u64,
+    },
     DictionaryDecodeError(DictionaryDecodeError),
     FailedToReadBlockHeader(BlockHeaderReadError),
     FailedToReadBlockBody(DecodeBlockContentError),
@@ -489,7 +492,16 @@ pub enum FrameDecoderError {
     FailedToDrainDecodebuffer(Error),
     FailedToSkipFrame,
     TargetTooSmall,
-    DictNotProvided { dict_id: u32 },
+    DictNotProvided {
+        dict_id: u32,
+    },
+    /// The content decoded is not the content the frame was made from: its checksum differs from the one
+    /// the frame ends with. Reported by [`FrameDecoder::decode_all`](super::FrameDecoder::decode_all) with
+    /// the `hash` feature.
+    ChecksumMismatch {
+        expected: u32,
+        calculated: u32,
+    },
 }
 
 #[cfg(feature = "std")]
@@ -512,6 +524,15 @@ impl StdError for FrameDecoderError {
 impl core::fmt::Display for FrameDecoderError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> ::core::fmt::Result {
         match self {
+            FrameDecoderError::ChecksumMismatch {
+                expected,
+                calculated,
+            } => {
+                write!(
+                    f,
+                    "The checksum of the decoded content is {calculated:#010x}, the frame ends with {expected:#010x}",
+                )
+            }
             FrameDecoderError::ReadFrameHeaderError(e) => {
                 write!(f, "{e:?}")
             }
