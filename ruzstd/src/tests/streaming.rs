@@ -511,3 +511,20 @@ fn more_content_than_stated() {
         }
     }
 }
+
+/// A frame cut short in its checksum is an error, and stays one when the read is tried again.
+#[cfg(feature = "hash")]
+#[test]
+fn a_cut_checksum_is_an_error_again_on_a_retry() {
+    use crate::decoding::StreamingDecoder;
+    use crate::io::Read;
+    let data: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+    // The frames of the stream compressor end with a checksum
+    let frame =
+        crate::encoding::compress_to_vec(&data[..], crate::encoding::CompressionLevel::Default);
+    let mut source = &frame[..frame.len() - 2];
+    let mut decoder = StreamingDecoder::new(&mut source).unwrap();
+    let mut out = Vec::new();
+    assert!(decoder.read_to_end(&mut out).is_err());
+    assert!(decoder.read_to_end(&mut out).is_err());
+}
