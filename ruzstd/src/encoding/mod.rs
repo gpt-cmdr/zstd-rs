@@ -8,8 +8,10 @@ pub(crate) mod match_generator;
 pub(crate) mod util;
 pub(crate) mod window_matcher;
 
+mod compressor;
 mod frame_compressor;
 mod levels;
+pub use compressor::Compressor;
 pub use dictionary::Dictionary;
 pub use frame_compressor::FrameCompressor;
 pub use match_generator::MatchGeneratorDriver;
