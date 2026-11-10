@@ -239,3 +239,37 @@ fn content_size_is_that_of_the_frame_headers() {
     assert_eq!(content_size(&[&sized[..], &[0]].concat()), None);
     assert_eq!(content_size(&skip[..9]), None);
 }
+
+/// A skippable frame claiming the longest length is an error, not an offset that wraps around, and
+/// the decoder holds nothing of an earlier frame after `decode_all`.
+#[test]
+fn skippable_lengths_and_stale_state() {
+    use crate::decoding::content_size;
+    let long_skip = [
+        &0x184D_2A50u32.to_le_bytes()[..],
+        &u32::MAX.to_le_bytes(),
+        &[0; 16],
+    ]
+    .concat();
+    assert_eq!(content_size(&long_skip), None);
+    let mut decoder = FrameDecoder::new();
+    assert!(decoder.decode_all(&long_skip, &mut [0; 8]).is_err());
+
+    let data = sample(200_000, 4);
+    let frame = zstd::bulk::compress(&data, 3).unwrap();
+    // A frame left half decoded in the streaming state
+    let mut source = &frame[..];
+    decoder.init(&mut source).unwrap();
+    decoder
+        .decode_blocks(
+            &mut source,
+            crate::decoding::BlockDecodingStrategy::UptoBlocks(1),
+        )
+        .unwrap();
+    assert!(decoder.can_collect() > 0 || !decoder.is_finished());
+    let mut out = vec![0; data.len()];
+    assert_eq!(decoder.decode_all(&frame, &mut out).unwrap(), data.len());
+    assert!(out == data);
+    assert_eq!(decoder.can_collect(), 0);
+    assert!(decoder.collect().is_none());
+}

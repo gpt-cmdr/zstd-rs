@@ -559,7 +559,13 @@ impl FrameDecoder {
     /// `output` must be large enough to hold the decompressed data. If you don't know
     /// how large the output will be, use [`FrameDecoder::decode_blocks`] instead.
     ///
-    /// This calls [`FrameDecoder::init`], and all bytes currently in the decoder will be lost.
+    /// All bytes currently in the decoder are lost. Afterwards the decoder holds no frame: of the
+    /// accessors only [`FrameDecoder::get_checksum_from_data`] and
+    /// [`FrameDecoder::get_calculated_checksum`] tell of the last frame decoded (the others do
+    /// too after a frame with a dictionary, which is decoded as a stream). With the `hash`
+    /// feature, content without the checksum its frame ends with is a
+    /// [`FrameDecoderError::ChecksumMismatch`]. Bytes of `output` after the decoded ones may be
+    /// written to.
     ///
     /// Returns the number of bytes written to `output`.
     pub fn decode_all(
@@ -578,6 +584,9 @@ impl FrameDecoder {
                 .get_or_insert_with(|| alloc::boxed::Box::new(DirectScratch::new()));
             match direct.decode_frame(input, output, max_window_size) {
                 Ok((read, written)) => {
+                    // What an earlier frame left in the streaming decoder is lost, as it was
+                    // when every frame started with `init`
+                    self.state = None;
                     self.last_frame_direct = true;
                     input = &input[read..];
                     output = &mut output[written..];
@@ -587,8 +596,9 @@ impl FrameDecoder {
                 Err(DirectError::Failed(FrameDecoderError::ReadFrameHeaderError(
                     crate::decoding::errors::ReadFrameHeaderError::SkipFrame { length, .. },
                 ))) => {
-                    input = input
-                        .get(8 + length as usize..)
+                    input = (length as usize)
+                        .checked_add(8)
+                        .and_then(|skip| input.get(skip..))
                         .ok_or(FrameDecoderError::FailedToSkipFrame)?;
                     continue;
                 }
@@ -608,6 +618,19 @@ impl FrameDecoder {
                 }
                 if self.is_finished() {
                     break;
+                }
+            }
+            // The checksum of a frame with a dictionary, as of the frames decoded above
+            #[cfg(feature = "hash")]
+            if let (Some(expected), Some(calculated)) = (
+                self.get_checksum_from_data(),
+                self.get_calculated_checksum(),
+            ) {
+                if expected != calculated {
+                    return Err(FrameDecoderError::ChecksumMismatch {
+                        expected,
+                        calculated,
+                    });
                 }
             }
         }

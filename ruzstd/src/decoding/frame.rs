@@ -256,7 +256,7 @@ pub fn content_size(mut data: &[u8]) -> Option<u64> {
         let header = match read_frame_header(&mut source) {
             Ok((header, _)) => header,
             Err(ReadFrameHeaderError::SkipFrame { length, .. }) => {
-                data = data.get(8 + length as usize..)?;
+                data = data.get((length as usize).checked_add(8)?..)?;
                 if data.is_empty() {
                     return Some(total);
                 }
