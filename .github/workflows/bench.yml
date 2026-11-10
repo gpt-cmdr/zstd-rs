@@ -1,0 +1,153 @@
+name: Benchmark against the C library
+
+# Times the crate against the zstd C library on tiles of public rasters, on the hosted Linux (x86-64 and
+# AArch64) and Windows runners. macOS runners are left out on purpose. Run it by hand (Actions, "Run
+# workflow") or by pushing a branch named bench/* (the repository has a branch named ci, so ci/... names
+# cannot exist). Shared runners are noisy and differ in their processors: compare the ratios to the C
+# library, which ran on the same machine in the same job, and run it more than once.
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: Timed runs of each measurement (the best counts)
+        default: "7"
+  push:
+    branches: ["bench/*"]
+
+permissions:
+  contents: read
+
+jobs:
+  rasterbench:
+    name: rasterbench ${{ matrix.os }}${{ matrix.variant && format(' ({0})', matrix.variant) || '' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every job is listed: an `include` entry that only names an existing `os` would change that job
+        # instead of adding one.
+        include:
+          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
+          - os: windows-latest
+          # The C library decodes Huffman streams with hand-written assembly on x86-64 (not with MSVC, and
+          # not on other processors). This job builds it without, to tell how much of a difference on
+          # Linux x86-64 is the assembly and how much the C compiler.
+          - os: ubuntu-latest
+            variant: C library without assembly
+            artifact: -no-asm
+            cflags: -DZSTD_DISABLE_ASM
+          # With GCC and Clang on x86-64 the C library also compiles its decoding loops for BMI2 and picks
+          # them when the processor has it; the crate is compiled for the baseline x86-64 only. This job
+          # compiles the crate for x86-64-v3 (BMI2, AVX2) to tell what that is worth.
+          - os: ubuntu-latest
+            variant: crate compiled for x86-64-v3
+            artifact: -v3
+            rustflags: -C target-cpu=x86-64-v3
+          # The C library compiled by GCC (MinGW-w64) instead of MSVC, on the same system
+          - os: windows-latest
+            variant: GNU toolchain
+            artifact: -gnu
+            target: x86_64-pc-windows-gnu
+          # Decoding into one buffer instead of a new one for every frame (REUSE_OUT of the example):
+          # what allocating the output costs differs between the systems, and it costs both libraries
+          - os: ubuntu-latest
+            variant: output buffer reused
+            artifact: -reuse
+            reuse_out: "1"
+          - os: windows-latest
+            variant: output buffer reused
+            artifact: -reuse
+            reuse_out: "1"
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUNS: ${{ inputs.runs || '7' }}
+      CFLAGS: ${{ matrix.cflags }}
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+      REUSE_OUT: ${{ matrix.reuse_out }}
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Machine
+        run: |
+          case "$RUNNER_OS" in
+            Linux) cpu=$(lscpu | sed -n 's/^Model name: *//p' | head -n 1)
+                   cores=$(nproc) ;;
+            Windows) cpu=$(powershell -NoProfile -Command "(Get-CimInstance Win32_Processor | Select-Object -First 1).Name")
+                     cores=$NUMBER_OF_PROCESSORS ;;
+          esac
+          {
+            echo "## rasterbench on ${{ matrix.os }}${{ matrix.variant && format(' ({0})', matrix.variant) || '' }}"
+            echo
+            echo "- CPU: $(echo "$cpu" | tr -d '\r') ($cores logical cores, $RUNNER_ARCH)"
+            echo "- Image: $ImageOS $ImageVersion"
+            echo "- Compiler: $(rustc --version), target ${CARGO_BUILD_TARGET:-$(rustc -vV | sed -n 's/^host: //p')}, RUSTFLAGS \"$RUSTFLAGS\""
+            echo "- Timed runs: $RUNS (the best counts; level 19 runs once)"
+          } | tee machine.md
+          if [ "$RUNNER_OS" = Linux ]; then lscpu; fi
+
+      - name: Build the example
+        run: |
+          if [ -z "$CARGO_BUILD_TARGET" ]; then unset CARGO_BUILD_TARGET; fi
+          cargo build --release --example rasterbench
+          mkdir -p bench-data
+          cp target/$CARGO_BUILD_TARGET/release/examples/rasterbench${{ runner.os == 'Windows' && '.exe' || '' }} bench-data/
+          tree=$(cargo tree -p zstd-rust --prefix none)
+          echo "- C library: $(grep '^zstd-sys' <<< "$tree" | sort -u), CFLAGS \"$CFLAGS\"" | tee -a machine.md
+          if [ "$RUNNER_OS" != Windows ]; then
+            echo "- Symbols of the C library's Huffman assembly in the binary: $(nm bench-data/rasterbench | grep -c fast_asm_loop || true)" | tee -a machine.md
+          fi
+
+      - name: Download the rasters and cut them into chunks
+        run: |
+          python -m pip install --quiet numpy rasterio
+          python ruzstd/benches/raster_chunks.py --download bench-data/rasters bench-data/chunks | tee chunks.txt
+
+      - name: Run
+        run: |
+          ./bench-data/rasterbench bench-data/chunks | tee rasterbench.txt
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            cat machine.md
+            echo
+            python ruzstd/benches/rasterbench_table.py < rasterbench.txt
+            echo
+            echo "<details><summary>Output of the example</summary>"
+            echo
+            echo '```'
+            cat rasterbench.txt
+            echo '```'
+            echo
+            echo "</details>"
+          } > summary.md
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the tables
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rasterbench-${{ matrix.os }}${{ matrix.artifact }}
+          path: |
+            summary.md
+            machine.md
+            rasterbench.txt
+            chunks.txt
+          if-no-files-found: warn
