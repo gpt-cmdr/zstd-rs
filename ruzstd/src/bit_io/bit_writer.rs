@@ -322,10 +322,10 @@ mod tests {
             state ^= state << 17;
             state
         };
-        for symbol in 0..256 {
-            lengths[symbol] = 1 + (next() % 11) as usize;
-            codes.bits[symbol] = next() & ((1 << lengths[symbol]) - 1);
-            codes.scale[symbol] = 1 << lengths[symbol];
+        for (symbol, length) in lengths.iter_mut().enumerate() {
+            *length = 1 + (next() % 11) as usize;
+            codes.bits[symbol] = next() & ((1 << *length) - 1);
+            codes.scale[symbol] = 1 << *length;
         }
         // Lengths around the group size and past the room the output is extended by
         for len in [0usize, 1, 4, 5, 6, 9, 10, 11, 127, 5000, 20_003] {
