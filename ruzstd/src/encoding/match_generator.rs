@@ -32,6 +32,12 @@ impl MatchGeneratorDriver {
         }
     }
 
+    /// As [`Matcher::commit_space`], for a block that is not in a space of this matcher. The block is the
+    /// last space afterwards.
+    pub(crate) fn commit_slice(&mut self, block: &[u8]) {
+        self.matcher.commit_slice(block)
+    }
+
     fn params(level: CompressionLevel) -> MatcherParams {
         // Uncompressed frames only use the window size (for the frame header) and the spaces
         MatcherParams::for_level(level)

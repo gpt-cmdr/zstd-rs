@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 
 use crate::{
-    bit_io::BitWriter,
+    bit_io::{BitWriter, ByteCodes},
     fse::fse_encoder::{self, FSEEncoder},
 };
 
@@ -28,7 +28,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         if with_table {
             self.write_table();
         }
-        Self::encode_stream(self.table, self.writer, data);
+        Self::encode_stream(&self.table.byte_codes(), self.writer, data);
     }
 
     /// Encodes the data using the provided table in 4 concatenated streams
@@ -51,6 +51,8 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             self.write_table();
         }
 
+        let codes = self.table.byte_codes();
+
         // Reserve space for the jump table, will be changed later
         let size_idx = self.writer.index();
         self.writer.write_bits(0u16, 16);
@@ -59,18 +61,18 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
 
         // Write the 4 streams, noting the sizes of the encoded streams
         let index_before = self.writer.index();
-        Self::encode_stream(self.table, self.writer, src1);
+        Self::encode_stream(&codes, self.writer, src1);
         let size1 = (self.writer.index() - index_before) / 8;
 
         let index_before = self.writer.index();
-        Self::encode_stream(self.table, self.writer, src2);
+        Self::encode_stream(&codes, self.writer, src2);
         let size2 = (self.writer.index() - index_before) / 8;
 
         let index_before = self.writer.index();
-        Self::encode_stream(self.table, self.writer, src3);
+        Self::encode_stream(&codes, self.writer, src3);
         let size3 = (self.writer.index() - index_before) / 8;
 
-        Self::encode_stream(self.table, self.writer, src4);
+        Self::encode_stream(&codes, self.writer, src4);
 
         // Sanity check, if this doesn't hold we produce a broken stream
         assert!(size1 <= u16::MAX as usize);
@@ -85,17 +87,11 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
 
     /// Encode one stream and pad it to fill the last byte
     fn encode_stream<VV: AsMut<Vec<u8>>>(
-        table: &HuffmanTable,
+        codes: &ByteCodes,
         writer: &mut BitWriter<VV>,
         data: &[u8],
     ) {
-        // Each code with its number of bits, in sixteen bits (a code has at most eleven)
-        let mut codes = [0u16; 256];
-        for (packed, &(code, num_bits)) in codes.iter_mut().zip(&table.codes) {
-            debug_assert!(num_bits <= 11 && code >> num_bits == 0);
-            *packed = ((code as u16) << 4) | u16::from(num_bits);
-        }
-        writer.add_codes_reversed(data, &codes);
+        writer.add_codes_reversed(data, codes);
 
         let bits_to_fill = writer.misaligned();
         if bits_to_fill == 0 {
@@ -267,6 +263,20 @@ impl HuffmanTable {
         }
 
         table
+    }
+
+    /// The codes as the bit writer takes them
+    fn byte_codes(&self) -> ByteCodes {
+        let mut codes = ByteCodes {
+            bits: [0; 256],
+            scale: [1; 256],
+        };
+        for (symbol, &(code, num_bits)) in self.codes.iter().enumerate() {
+            debug_assert!(num_bits <= 11 && code >> num_bits == 0);
+            codes.bits[symbol] = u64::from(code);
+            codes.scale[symbol] = 1 << num_bits;
+        }
+        codes
     }
 
     pub fn can_encode(&self, other: &Self) -> Option<usize> {

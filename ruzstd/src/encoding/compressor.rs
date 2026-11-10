@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use super::block_header::BlockHeader;
 use super::frame_compressor::{CompressState, FseTables, INITIAL_OFFSET_HISTORY};
 use super::frame_header::FrameHeader;
-use super::levels::compress_matched_block;
+use super::levels::compress_committed_block;
 use super::{CompressionLevel, MatchGeneratorDriver, Matcher};
 use crate::blocks::block::BlockType;
 use crate::common::MAX_BLOCK_SIZE;
@@ -59,9 +59,15 @@ impl Compressor {
     }
 
     /// Compresses `data` into a frame.
+    ///
+    /// The frame is returned in a buffer with room for incompressible data (the size of `data` and a few bytes
+    /// per block), so that it never has to be moved while it grows: memory the operating system only hands
+    /// out as it is written to. Call `shrink_to_fit` on frames that are kept, or compress with
+    /// [`compress_into`](Self::compress_into) into a buffer that is used again, which also saves the
+    /// allocation.
     pub fn compress(&mut self, data: &[u8]) -> Vec<u8> {
-        // Most data shrinks; incompressible data takes its size and a few bytes per block.
-        let mut output = Vec::with_capacity(data.len() / 2 + 64);
+        let blocks = data.len() / MAX_BLOCK_SIZE as usize + 1;
+        let mut output = Vec::with_capacity(data.len() + 3 * blocks + 32);
         self.compress_into(data, &mut output);
         output
     }
@@ -107,10 +113,8 @@ impl Compressor {
                 .serialize(output);
                 output.extend_from_slice(block);
             } else {
-                let mut space = state.matcher.get_next_space();
-                space.clear();
-                space.extend_from_slice(block);
-                compress_matched_block(state, last_block, space, output);
+                state.matcher.commit_slice(block);
+                compress_committed_block(state, last_block, output);
             }
         }
     }
