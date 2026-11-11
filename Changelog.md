@@ -23,15 +23,15 @@ chunk, on an x86-64 desktop. `cargo run --release --example rasterbench` reprodu
 
   | | `decode_all` before | now | `read_to_end` before | now |
   |---|---|---|---|---|
-  | Linux x86-64, EPYC 7763 | 1.47 to 1.58 | 1.23 to 1.25 | 1.59 to 1.64 | 1.35 to 1.37 |
+  | Linux x86-64, EPYC 7763 | 1.47 to 1.58 | 1.23 to 1.26 | 1.59 to 1.64 | 1.35 to 1.38 |
   | Linux x86-64, EPYC 9V74 | 1.53 to 1.58 | 1.31 to 1.34 | 1.66 to 1.72 | 1.46 to 1.50 |
   | Linux x86-64, EPYC 9V45 | 1.53 to 1.60 | 1.30 to 1.37 | | 1.38 to 1.44 |
   | Linux x86-64, Xeon 8370C | 1.56 to 1.69 | 1.28 to 1.34 | 1.72 to 1.83 | 1.45 to 1.51 |
   | Linux AArch64, Neoverse N2 | 1.22 to 1.24 | 1.12 to 1.17 | 1.33 to 1.37 | 1.25 to 1.26 |
   | Windows x86-64, MSVC | 1.12 to 1.13 | 0.92 to 0.98 | 1.22 to 1.25 | 1.02 to 1.11 |
 
-  (The ranges are over the three levels and the runs, one to four of each.)
-  A single file and level is at 1.15 to 1.48 for `decode_all` on Linux x86-64 (1.37 to 1.80 before). What changed:
+  (The ranges are over the three levels and the runs, two to five of each.)
+  A single file and level is at 1.14 to 1.48 for `decode_all` on Linux x86-64 (1.37 to 1.80 before). What changed:
   * The loops that decode Huffman-coded literals compute up front how many iterations all four streams have input
     and room for and then check only their count, and they count the bits a stream has read by a marker bit behind
     them instead of a counter, as the reference decoder's loops do. Two symbols per lookup are used for literals
