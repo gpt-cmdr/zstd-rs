@@ -2,6 +2,7 @@
 //! decoder, which decodes through a window buffer.
 #![cfg(test)]
 
+use crate::common::cpu::testing::on_every_path;
 use crate::decoding::{FrameDecoder, StreamingDecoder};
 use crate::io::Read;
 use alloc::vec;
@@ -61,6 +62,10 @@ pub(super) fn sample(len: usize, seed: u64) -> Vec<u8> {
 
 #[test]
 fn decodes_the_corpus_as_the_streaming_decoder_does() {
+    on_every_path(decodes_the_corpus_as_the_streaming_decoder_does_on_this_path);
+}
+
+fn decodes_the_corpus_as_the_streaming_decoder_does_on_this_path() {
     let mut decoder = FrameDecoder::new();
     let mut files = 0;
     for entry in std::fs::read_dir("./decodecorpus_files").unwrap() {
@@ -90,6 +95,10 @@ fn decodes_the_corpus_as_the_streaming_decoder_does() {
 
 #[test]
 fn decodes_frames_of_every_encoder() {
+    on_every_path(decodes_frames_of_every_encoder_on_this_path);
+}
+
+fn decodes_frames_of_every_encoder_on_this_path() {
     use crate::encoding::{compress_to_vec, CompressionLevel};
     let mut decoder = FrameDecoder::new();
     for (i, len) in [
@@ -136,6 +145,10 @@ fn decodes_frames_of_every_encoder() {
 /// Damaged frames are errors or decode as the streaming decoder decodes them, without a panic.
 #[test]
 fn damaged_frames_do_not_panic() {
+    on_every_path(damaged_frames_do_not_panic_on_this_path);
+}
+
+fn damaged_frames_do_not_panic_on_this_path() {
     let mut decoder = FrameDecoder::new();
     let mut rng = Lcg(2024);
     let data = sample(300_000, 5);

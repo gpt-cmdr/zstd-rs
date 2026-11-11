@@ -4,6 +4,7 @@
 #![cfg(test)]
 
 use super::direct::{sample, Lcg};
+use crate::common::cpu::testing::on_every_path;
 use crate::decoding::{BlockDecodingStrategy, Dictionary, FrameDecoder, StreamingDecoder};
 use crate::io::Read;
 use alloc::vec;
@@ -103,6 +104,10 @@ fn reads_in_pieces_of_every_size() {
 
 #[test]
 fn reads_to_the_end() {
+    on_every_path(reads_to_the_end_on_this_path);
+}
+
+fn reads_to_the_end_on_this_path() {
     let data = sample(700_000, 22);
     let mut decoder = FrameDecoder::new();
     for (f, (frame, checksum)) in frames(&data).iter().enumerate() {
@@ -149,6 +154,10 @@ fn reads_to_the_end() {
 /// the decoder and by ones that let the buffer grow.
 #[test]
 fn decodes_blocks_and_collects() {
+    on_every_path(decodes_blocks_and_collects_on_this_path);
+}
+
+fn decodes_blocks_and_collects_on_this_path() {
     let data = sample(900_000, 23);
     let mut decoder = FrameDecoder::new();
     let mut rounds = 0;
@@ -199,6 +208,10 @@ fn decodes_blocks_and_collects() {
 /// `decode_from_to`, from sources that hold a part of the frame into targets of every size.
 #[test]
 fn decodes_from_slices_to_slices() {
+    on_every_path(decodes_from_slices_to_slices_on_this_path);
+}
+
+fn decodes_from_slices_to_slices_on_this_path() {
     let data = sample(700_000, 24);
     for (f, (frame, _)) in frames(&data).iter().enumerate() {
         for &(source_len, target_len) in &[
@@ -263,6 +276,10 @@ fn dictionary_data(samples: &[Vec<u8>], seed: u64) -> Vec<u8> {
 
 #[test]
 fn decodes_frames_with_a_dictionary() {
+    on_every_path(decodes_frames_with_a_dictionary_on_this_path);
+}
+
+fn decodes_frames_with_a_dictionary_on_this_path() {
     let samples = dictionary_samples();
     let trained = zstd::dict::from_samples(&samples, 16_000).unwrap();
     let dict_id = Dictionary::decode_dict(&trained).unwrap().id;
@@ -359,6 +376,10 @@ fn one_match_frame(offset_code: u8, offset_bit: Option<bool>) -> Vec<u8> {
 /// and one at offset value 3 at the first less one: what a dictionary sets them to.
 #[test]
 fn repeated_offsets_of_a_dictionary() {
+    on_every_path(repeated_offsets_of_a_dictionary_on_this_path);
+}
+
+fn repeated_offsets_of_a_dictionary_on_this_path() {
     let read = |frame: &[u8], offsets: [u32; 3]| -> Result<Vec<u8>, crate::io::Error> {
         let mut dict = Dictionary::from_raw_content(5, b"0123456789".to_vec());
         dict.offset_hist = offsets;
@@ -398,6 +419,10 @@ fn reference(frame: &[u8], dict: Option<&[u8]>, limit: usize) -> Option<Vec<u8>>
 /// the C library decodes them to: never a panic.
 #[test]
 fn damaged_frames_do_not_panic() {
+    on_every_path(damaged_frames_do_not_panic_on_this_path);
+}
+
+fn damaged_frames_do_not_panic_on_this_path() {
     let samples = dictionary_samples();
     let trained = zstd::dict::from_samples(&samples, 16_000).unwrap();
     let with_dict = dictionary_data(&samples, 8);

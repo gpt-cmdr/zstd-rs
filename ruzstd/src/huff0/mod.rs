@@ -36,6 +36,55 @@ pub fn round_trip(data: &[u8]) {
     assert_eq!(&decoded, data);
 }
 
+/// The four streams of a literals section, decoded side by side: a symbol and two symbols per
+/// lookup, with the loops the processor allows and with those the crate is compiled with, for
+/// streams of every length up to where all of the loops have run.
+#[test]
+fn four_streams_round_trip() {
+    use crate::bit_io::BitWriter;
+    use crate::common::cpu::testing::on_every_path;
+    use alloc::vec::Vec;
+
+    let mut state = 12345u32;
+    let mut random = move || {
+        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        state >> 16
+    };
+    // Symbols of few bits (two fit in a lookup, and enough of them make the table of pairs
+    // pay) and of many.
+    for (symbols, sizes) in [(4u32, 4090..4130usize), (200, 16..300), (200, 4090..4130)] {
+        let longest = sizes.end;
+        let all: Vec<u8> = (0..longest)
+            .map(|_| (random() % symbols).min(random() % symbols) as u8)
+            .collect();
+        let table = huff0_encoder::HuffmanTable::build_from_data(&all);
+        for size in sizes {
+            let data = &all[..size];
+            let mut writer = BitWriter::new();
+            let mut encoder = huff0_encoder::HuffmanEncoder::new(&table, &mut writer);
+            encoder.encode4x(data, true);
+            let encoded = writer.dump();
+            on_every_path(|| {
+                let mut decoder_table = HuffmanTable::new();
+                let table_bytes = decoder_table.build_decoder(&encoded).unwrap() as usize;
+                let (jumps, streams) = encoded[table_bytes..].split_at(6);
+                let jump = |at: usize| usize::from(u16::from_le_bytes([jumps[at], jumps[at + 1]]));
+                let jumps = [jump(0), jump(0) + jump(2), jump(0) + jump(2) + jump(4)];
+                let mut decoded = alloc::vec![0xAA; size];
+                decoder_table
+                    .decode_four_streams(streams, jumps, &mut decoded)
+                    .expect("the streams are the symbols of the data");
+                assert!(decoded == data, "{} symbols of {}", size, symbols);
+                // One symbol fewer leaves bits of a stream unread: these are not its symbols.
+                let mut short = alloc::vec![0; size - 1];
+                assert!(decoder_table
+                    .decode_four_streams(streams, jumps, &mut short)
+                    .is_none());
+            });
+        }
+    }
+}
+
 #[test]
 fn roundtrip() {
     use alloc::vec::Vec;
