@@ -1,3 +1,11 @@
+// SPDX-FileCopyrightText: Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-FileCopyrightText: Copyright (c) 2019 Moritz Borcherding
+// SPDX-License-Identifier: MIT AND BSD-3-Clause
+//
+// `compute_epoch_info` is a translation, from ruzstd, of Zstandard's `COVER_computeEpochs`
+// (https://github.com/facebook/zstd, lib/dictBuilder/cover.c), under its BSD license (see NOTICE
+// and LICENSE-ZSTD).
+
 //! An implementation of the local maximum coverage algorithm
 //! described in the paper "Effective Construction of Relative Lempel-Ziv Dictionaries",
 //! by Liao, Petri, Moffat, and Wirth, published under the University of Melbourne.

@@ -1,3 +1,16 @@
+// SPDX-FileCopyrightText: Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-FileCopyrightText: Copyright (c) 2019 Moritz Borcherding
+// SPDX-FileCopyrightText: Copyright (c) 2026 William Katzenmeyer / CLB Engineering Corporation
+// SPDX-License-Identifier: MIT AND BSD-3-Clause
+//
+// Parts of this file are adapted from Zstandard (https://github.com/facebook/zstd), under its
+// BSD license (see NOTICE and LICENSE-ZSTD):
+//   lib/compress/zstd_fast.c (ZSTD_compressBlock_fast_noDict_generic)
+//   lib/compress/zstd_double_fast.c (ZSTD_compressBlock_doubleFast_noDict_generic)
+//   lib/compress/zstd_lazy.c (the row match finder and its lazy skipping)
+//   lib/compress/zstd_compress_internal.h (the hash multipliers)
+//   lib/compress/clevels.h (the parameters of the levels)
+
 //! Matchers that keep the whole window in one contiguous buffer
 //!
 //! This is the matching used for every compression level. The levels differ in the strategy, which follows the

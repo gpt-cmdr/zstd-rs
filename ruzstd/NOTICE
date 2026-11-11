@@ -1,0 +1,71 @@
+zstd-rust
+=========
+
+zstd-rust is a fork of ruzstd (https://github.com/KillingSpark/zstd-rs), licensed under the MIT
+License (see LICENSE).
+
+Parts of zstd-rust are adapted from Zstandard (https://github.com/facebook/zstd), the reference
+implementation of the format, which is licensed under the BSD license below (or GPLv2; this fork
+uses it under the BSD license). Those parts are therefore under the MIT License and the BSD
+license together (SPDX: MIT AND BSD-3-Clause). The files with code adapted from Zstandard start
+with SPDX headers that name the Zstandard sources they follow (paths in this package):
+
+  src/encoding/window_matcher.rs
+    from lib/compress/zstd_fast.c (ZSTD_compressBlock_fast_noDict_generic)
+    from lib/compress/zstd_double_fast.c (ZSTD_compressBlock_doubleFast_noDict_generic)
+    from lib/compress/zstd_lazy.c (the row match finder and its lazy skipping)
+    from lib/compress/zstd_compress_internal.h (the hash multipliers)
+    from lib/compress/clevels.h (the parameters of the levels)
+  src/fse/fse_encoder.rs
+    from lib/compress/fse_compress.c (FSE_optimalTableLog_internal, FSE_normalizeCount, FSE_normalizeM2, FSE_buildCTable_wksp)
+    from lib/common/fse.h (FSE_initCState2, FSE_encodeSymbol)
+  src/huff0/huff0_decoder.rs
+    from lib/decompress/huf_decompress.c (the fast four-stream decoding loops and the two-symbol table)
+  src/decoding/direct.rs
+    from lib/decompress/zstd_decompress_block.c (sequence decoding and execution)
+  src/common/cpu.rs
+    from lib/common/portability_macros.h and lib/common/cpu.h (choosing BMI2 code at run time, DYNAMIC_BMI2)
+  src/dictionary/cover.rs (the `dict_builder` feature; from ruzstd)
+    from lib/dictBuilder/cover.c (COVER_computeEpochs)
+
+Elsewhere the code is ruzstd's or written for this fork, following the format specification
+(RFC 8878), with some designs informed by Zstandard's documentation and behaviour.
+
+Redistributions of zstd-rust, in source or binary form (including programs and libraries built
+with it), must reproduce the Zstandard notice below, as its license requires, and may not use the
+names Facebook or Meta, or the names of Zstandard's contributors, to endorse or promote them.
+
+-------------------------------------------------------------------------------
+Zstandard (https://github.com/facebook/zstd)
+-------------------------------------------------------------------------------
+
+BSD License
+
+For Zstandard software
+
+Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+ * Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+ * Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+ * Neither the name Facebook, nor Meta, nor the names of its contributors may
+   be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

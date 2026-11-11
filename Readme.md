@@ -252,4 +252,14 @@ This will tell you where the decoder panics exactly. If you are able to fix the 
 # Contributing
 
 Issues and pull requests for this fork go to <https://github.com/gpt-cmdr/zstd-rs>. Contributions are published
-under the same MIT license as this project. Please make an entry in the Changelog.md file when you make a PR.
+under the MIT License. Files with code adapted from Zstandard stay under its BSD license as well
+(see License below); code adapted from Zstandard has to be marked so, in the file's SPDX header and in NOTICE. Please make an entry in the Changelog.md file when you make a PR.
+
+## License
+
+MIT, as ruzstd, and for the parts adapted from [Zstandard](https://github.com/facebook/zstd) also its
+BSD license: the crate as a whole is `MIT AND BSD-3-Clause`.
+[NOTICE](https://github.com/gpt-cmdr/zstd-rs/blob/main/NOTICE) lists the adapted files;
+[LICENSE](https://github.com/gpt-cmdr/zstd-rs/blob/main/LICENSE) and
+[LICENSE-ZSTD](https://github.com/gpt-cmdr/zstd-rs/blob/main/LICENSE-ZSTD) have the two license texts. Programs that
+ship zstd-rust have to reproduce Zstandard's notice with their documentation.
