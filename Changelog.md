@@ -87,6 +87,28 @@ chunk, on an x86-64 desktop. `cargo run --release --example rasterbench` reprodu
 * New `encoding::Compressor`: compresses whole buffers to frames that state their content size and carry no
   checksum (as `ZSTD_compress`), with tables allocated once instead of for every call
 * A content size of 4 GiB or more was written with the wrong field size flag
+* `Fastest` and `Default` search with the loops of the reference implementation: two positions per turn with the
+  hash and table entry of each ready a step ahead (`Fastest`), the long entry of the next position loaded a step
+  ahead (`Default`), one multiplication and one shift per hash. Sequences are collected inside those loops and
+  their codes worked out afterwards; Huffman codes are gathered five to a word by multiplication. With a
+  `Compressor`, on the desktop, `Fastest` took 1.31 to 1.49 times as long as level 1 of the C library and now
+  takes 1.01 to 1.16 times as long; `Default` took 1.20 to 1.59 times as long as level 3 and now takes 1.01 to
+  1.37 times as long (1.01 to 1.27 on five of the six files). Sizes are within 0.5% of the C library's, as before.
+  On the hosted runners (geometric mean of the six files, levels 1 and 3): Windows 1.29 and 1.43 before, 1.17 and
+  1.21 now; Linux x86-64 1.70 and 1.55 before, 1.34 and 1.47 now; Linux AArch64 1.67 and 1.44 before, 1.37 and
+  1.35 now
+* `Compressor::compress` returns the frame in a buffer with room for incompressible data, which never has to be
+  moved while it grows (`shrink_to_fit` frames that are kept, or use `compress_into`), and copies each block of
+  the data once instead of twice
+* The lazy strategy with rows (`Better`, `Best`) no longer inserts every position it steps over: where nothing
+  was found for about 2 KiB only the positions that are searched are inserted, and of more than 384 positions to
+  insert at once only the first 96 and the last 32, as the reference implementation does. `Better` on nearly
+  incompressible data (Float32 elevation) took 1.7 times as long as level 9 on the desktop, 2.1 to 3.2 times on
+  the x86-64 runners, and now takes 0.6 to 0.9 times and 1.1 to 1.7 times as long, to frames 0.35% larger (as
+  large as level 9's). Other files do not change by more than 0.01% in size
+* Rows and candidates are prefetched on AArch64 too (`prfm`). They were read instead, which the processor waits
+  for: `Better` took 2.1 to 2.6 times as long as level 9 there (5.5 times on Float32 elevation) and, with the
+  change above, now takes 1.2 to 1.6 times as long. Other targets than x86-64 and AArch64 neither prefetch nor read
 
 # zstd-rust 0.1.0
 

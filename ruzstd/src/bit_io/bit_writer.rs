@@ -15,6 +15,14 @@ pub(crate) struct BitWriter<V: AsMut<Vec<u8>>> {
     bit_idx: usize,
 }
 
+/// The codes of the byte symbols of a prefix code, as [`BitWriter::add_codes_reversed`] takes them
+pub(crate) struct ByteCodes {
+    /// The bits of the code of each symbol, in the lowest bits
+    pub bits: [u64; 256],
+    /// Two to the power of the number of bits of the code of each symbol (at most 11 bits)
+    pub scale: [u64; 256],
+}
+
 impl BitWriter<Vec<u8>> {
     /// Initialize a new writer.
     pub fn new() -> Self {
@@ -199,30 +207,51 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         self.bits_in_partial += num_bits;
     }
 
-    /// Writes the codes of the symbols of `data`, from the last symbol to the first. A code of `codes` is
-    /// its number of bits (at most 11) in its lowest four bits and its bits above them.
+    /// Writes the codes of the symbols of `data`, from the last symbol to the first.
     ///
-    /// The codes of five symbols are gathered in a word (55 bits, next to at most 7 left from before) and
-    /// the word written to the output at once, which was sized for the longest codes beforehand.
-    pub fn add_codes_reversed(&mut self, data: &[u8], codes: &[u16; 256]) {
+    /// The codes of five symbols are gathered in a word (55 bits at most) on their own, so the gathering of
+    /// one group does not wait for the group before it, and the word is then put next to the at most 7 bits
+    /// left from before and written to the output at once.
+    pub fn add_codes_reversed(&mut self, data: &[u8], codes: &ByteCodes) {
         const SYMBOLS: usize = 5;
+        /// The output is extended by this much whenever a word does not fit anymore
+        const ROOM: usize = 4096;
+        // The codes of the symbols behind one another, the last symbol in the lowest bits, and a set bit
+        // above them. Appending a code is a multiplication by two to the power of its length: that is one
+        // instruction, where a shift by a variable count is three.
+        #[inline(always)]
+        fn gather(symbols: &[u8], codes: &ByteCodes) -> u64 {
+            let mut gathered = 1u64;
+            for &symbol in symbols {
+                debug_assert!(codes.scale[symbol as usize] > 1, "a symbol without a code");
+                gathered = gathered.wrapping_mul(codes.scale[symbol as usize])
+                    | codes.bits[symbol as usize];
+            }
+            gathered
+        }
         self.flush_full_bytes();
         let output = self.output.as_mut();
         let start = output.len();
-        output.resize(start + (data.len() * 11).div_ceil(8) + 16, 0);
         let mut at = start;
         let mut word = self.partial;
         let mut bits = self.bits_in_partial as u32;
         let (head, body) = data.split_at(data.len() % SYMBOLS);
-        for symbols in body.rchunks_exact(SYMBOLS).chain(core::iter::once(head)) {
-            for &symbol in symbols.iter().rev() {
-                let code = codes[symbol as usize];
-                debug_assert!(code & 15 != 0, "a symbol without a code");
-                word |= u64::from(code >> 4) << bits;
-                bits += u32::from(code & 15);
+        let groups = body
+            .rchunks_exact(SYMBOLS)
+            .map(|symbols| gather(symbols, codes))
+            .chain(core::iter::once(gather(head, codes)));
+        // The symbols not written yet, each of at most 11 bits: the output grows by no more than they need
+        let mut remaining = data.len();
+        for gathered in groups {
+            let count = 63 - gathered.leading_zeros();
+            word |= (gathered ^ (1 << count)) << bits;
+            if output.len() < at + 8 {
+                output.resize(at + 8 + usize::min(ROOM, remaining * 11 / 8 + 16), 0);
             }
+            remaining = remaining.saturating_sub(SYMBOLS);
             output[at..at + 8].copy_from_slice(&word.to_le_bytes());
             // At most 62 bits were gathered: seven bytes at most are complete
+            bits += count;
             let bytes = bits >> 3;
             at += bytes as usize;
             word >>= 8 * bytes;
@@ -274,8 +303,50 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
 
 #[cfg(test)]
 mod tests {
-    use super::BitWriter;
+    use super::{BitWriter, ByteCodes};
     use alloc::vec;
+    use alloc::vec::Vec;
+
+    #[test]
+    fn codes_reversed_are_the_codes_written_one_by_one() {
+        // Codes of 1 to 11 bits, of any bits: only their lengths and order matter here
+        let mut codes = ByteCodes {
+            bits: [0; 256],
+            scale: [1; 256],
+        };
+        let mut lengths = [0usize; 256];
+        let mut state = 0x1234_5678_9ABC_DEF1u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for (symbol, length) in lengths.iter_mut().enumerate() {
+            *length = 1 + (next() % 11) as usize;
+            codes.bits[symbol] = next() & ((1 << *length) - 1);
+            codes.scale[symbol] = 1 << *length;
+        }
+        // Lengths around the group size and past the room the output is extended by
+        for len in [0usize, 1, 4, 5, 6, 9, 10, 11, 127, 5000, 20_003] {
+            let data: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            for leading_bits in [0usize, 3, 7] {
+                let mut expected = BitWriter::new();
+                let mut writer = BitWriter::new();
+                expected.write_bits(0x55u16 >> (8 - leading_bits), leading_bits);
+                writer.write_bits(0x55u16 >> (8 - leading_bits), leading_bits);
+                for &symbol in data.iter().rev() {
+                    expected.write_bits(codes.bits[symbol as usize], lengths[symbol as usize]);
+                }
+                writer.add_codes_reversed(&data, &codes);
+                assert_eq!(writer.index(), expected.index(), "{len} symbols");
+                let fill = writer.misaligned();
+                expected.write_bits(0u8, fill);
+                writer.write_bits(0u8, fill);
+                assert_eq!(writer.dump(), expected.dump(), "{len} symbols");
+            }
+        }
+    }
 
     #[test]
     fn from_existing() {
