@@ -127,6 +127,19 @@ impl FSETable {
         Ok(bytes_read)
     }
 
+    /// Reads the distribution of a table from `source`, as [`FSETable::build_decoder`] does, and
+    /// leaves the decoding table empty: the bytes read. For a decoder that makes a table of its
+    /// own of the probabilities and the accuracy log.
+    pub(crate) fn read_distribution(
+        &mut self,
+        source: &[u8],
+        max_log: u8,
+    ) -> Result<usize, FSETableError> {
+        self.accuracy_log = 0;
+        self.decode.clear();
+        self.read_probabilities(source, max_log)
+    }
+
     /// Given the provided accuracy log, build a decoding table from that log.
     pub fn build_from_probabilities(
         &mut self,
