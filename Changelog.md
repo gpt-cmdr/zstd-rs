@@ -16,12 +16,45 @@ chunk, on an x86-64 desktop. `cargo run --release --example rasterbench` reprodu
   written to.
 * Huffman-coded literals are decoded four streams side by side through an 11-bit table, five lookups per refill,
   and two symbols per lookup where the literals compress well
+* Decoding is faster again, most of all against the C library as GCC builds it on Linux x86-64, which decodes a
+  quarter faster than the MSVC build the figures above compare with. Measured on the hosted runners of
+  `.github/workflows/bench.yml` (time over the C library's, geometric mean over the six raster files; the x86-64
+  runners have a different processor from run to run, and the ratio depends on it):
+
+  | | `decode_all` before | now | `read_to_end` before | now |
+  |---|---|---|---|---|
+  | Linux x86-64, EPYC 7763 | 1.47 to 1.58 | 1.23 to 1.25 | 1.59 to 1.64 | 1.35 to 1.37 |
+  | Linux x86-64, EPYC 9V74 | 1.53 to 1.58 | 1.31 to 1.34 | 1.66 to 1.72 | 1.46 to 1.50 |
+  | Linux x86-64, EPYC 9V45 | 1.53 to 1.60 | 1.30 to 1.37 | | 1.38 to 1.44 |
+  | Linux x86-64, Xeon 8370C | 1.56 to 1.69 | 1.28 to 1.34 | 1.72 to 1.83 | 1.45 to 1.51 |
+  | Linux AArch64, Neoverse N2 | 1.22 to 1.24 | 1.12 to 1.17 | 1.33 to 1.37 | 1.25 to 1.26 |
+  | Windows x86-64, MSVC | 1.12 to 1.13 | 0.92 to 0.98 | 1.22 to 1.25 | 1.02 to 1.11 |
+
+  (The ranges are over the three levels and the runs, one to four of each.)
+  A single file and level is at 1.15 to 1.48 for `decode_all` on Linux x86-64 (1.37 to 1.80 before). What changed:
+  * The loops that decode Huffman-coded literals compute up front how many iterations all four streams have input
+    and room for and then check only their count, and they count the bits a stream has read by a marker bit behind
+    them instead of a counter, as the reference decoder's loops do. Two symbols per lookup are used for literals
+    of less than 7 bits per symbol (6.5 before)
+  * Sequences are decoded sixteen at a time by a loop of its own and then executed, so that each loop keeps what it
+    works with in registers. The fields of a sequence are read from one word of bits at the sums of their lengths;
+    the usual sequence (at most 16 literals, a match of at most 16 bytes from 16 bytes back or more) is two copies
+    of 16 bytes behind few checks
+  * On x86-64 the Huffman loops and the loop that decodes sequences are compiled a second time for BMI2 (with BMI1
+    and LZCNT) and that copy is chosen at run time where the processor has it, as the C library does. This needs
+    the `std` feature and the one `unsafe` call of the decoder, of a function that enables the features after
+    `is_x86_feature_detected!` has found them; without `std`, and on other architectures, the loops run as compiled
+  * Sequence tables are built from the distributions of a block directly, the Huffman table from the code lengths
+    directly, and the buffer of the literals is not cleared for every block
+* `rasterbench` on the hosted runners: a job with the C library built without its BMI2 code paths, the Linux
+  binaries as artifacts, and a job that profiles decoding with `perf`
 * The streaming decoder (`StreamingDecoder`, `FrameDecoder::decode_blocks` and what collects from it, `decode_from_to`,
   `decode_all` for frames with a dictionary) decodes blocks with the code of `decode_all`, straight into its window
   buffer: no vector of sequences, no ring buffer. The window buffer is a zeroed `Vec<u8>` in which a block is always
   in one piece; at its end the next block starts over at the front, and matches that reach the older piece or the
   dictionary take a slower path. It starts small and grows to the window and two blocks, or to the size the frame
-  states. The ring buffer and its `unsafe` code are gone: the decoder has no `unsafe` left.
+  states. The ring buffer and its `unsafe` code are gone: the only `unsafe` left in the decoder is the call that
+  chooses the loops compiled for BMI2 (above).
   Measured as above (four runs alternating with the previous code, on a machine with other work running, so single
   figures move by a third): a `StreamingDecoder` read in pieces through `Read::take` into an empty vector took 1.6 to
   5.0 times as long as `zstd::bulk::decompress` (median of the runs per file and level; 3.25 times over all) and
