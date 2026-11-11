@@ -1,3 +1,12 @@
+// SPDX-FileCopyrightText: Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-FileCopyrightText: Copyright (c) 2019 Moritz Borcherding
+// SPDX-FileCopyrightText: Copyright (c) 2026 William Katzenmeyer / CLB Engineering Corporation
+// SPDX-License-Identifier: MIT AND BSD-3-Clause
+//
+// Parts of this file are adapted from Zstandard (https://github.com/facebook/zstd), under its
+// BSD license (see NOTICE and LICENSE-ZSTD):
+//   lib/decompress/huf_decompress.c (the fast four-stream decoding loops and the two-symbol table)
+
 //! Utilities for decoding Huff0 encoded huffman data.
 
 use crate::bit_io::{BackBits, BitReaderReversed};

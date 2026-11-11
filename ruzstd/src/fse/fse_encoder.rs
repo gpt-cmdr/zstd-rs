@@ -1,3 +1,13 @@
+// SPDX-FileCopyrightText: Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-FileCopyrightText: Copyright (c) 2019 Moritz Borcherding
+// SPDX-FileCopyrightText: Copyright (c) 2026 William Katzenmeyer / CLB Engineering Corporation
+// SPDX-License-Identifier: MIT AND BSD-3-Clause
+//
+// Parts of this file are adapted from Zstandard (https://github.com/facebook/zstd), under its
+// BSD license (see NOTICE and LICENSE-ZSTD):
+//   lib/compress/fse_compress.c (FSE_optimalTableLog_internal, FSE_normalizeCount, FSE_normalizeM2, FSE_buildCTable_wksp)
+//   lib/common/fse.h (FSE_initCState2, FSE_encodeSymbol)
+
 //! FSE encoding tables and the encoder used for the Huffman table description.
 //!
 //! The table layout follows the usual tANS formulation: the encoder state is a value in

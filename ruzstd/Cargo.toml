@@ -7,7 +7,7 @@ authors = [
     "William Katzenmeyer / CLB Engineering Corporation",
 ]
 edition = "2018"
-license = "MIT"
+license = "MIT AND BSD-3-Clause"
 homepage = "https://github.com/gpt-cmdr/zstd-rs"
 repository = "https://github.com/gpt-cmdr/zstd-rs"
 documentation = "https://docs.rs/zstd-rust"

@@ -1,3 +1,12 @@
+// SPDX-FileCopyrightText: Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-FileCopyrightText: Copyright (c) 2019 Moritz Borcherding
+// SPDX-FileCopyrightText: Copyright (c) 2026 William Katzenmeyer / CLB Engineering Corporation
+// SPDX-License-Identifier: MIT AND BSD-3-Clause
+//
+// Parts of this file are adapted from Zstandard (https://github.com/facebook/zstd), under its
+// BSD license (see NOTICE and LICENSE-ZSTD):
+//   lib/common/portability_macros.h and lib/common/cpu.h (choosing BMI2 code at run time, DYNAMIC_BMI2)
+
 //! Running the decoder's loops as the processor at hand runs them best.
 //!
 //! The crate is compiled for a baseline processor: on x86-64 that is one without BMI2, where a

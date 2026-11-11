@@ -4,6 +4,12 @@ This document records the changes made between versions, starting with version 0
 
 # Unreleased
 
+* Licensing: parts of the crate are adapted from Zstandard (the C reference implementation): the
+  matchers, FSE count normalization, the fast Huffman and sequence decoding loops and the BMI2
+  dispatch. They carry Zstandard's BSD license as well as the MIT License: the package's license is
+  now `MIT AND BSD-3-Clause`, `NOTICE` lists the adapted files and `LICENSE-ZSTD` has the BSD text,
+  and the adapted files start with SPDX headers naming their sources. Distributions of programs
+  built with the crate have to reproduce that notice.
 Speed, measured against the zstd C library (1.5.7, through the `zstd` crate) on 1 MiB chunks of rasters (USGS
 elevation as Float32, SRTM as Int16, Landsat as 4 x UInt8, each with and without the TIFF predictor), a frame per
 chunk, on an x86-64 desktop. `cargo run --release --example rasterbench` reproduces the comparison on any files.
