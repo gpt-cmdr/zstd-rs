@@ -252,7 +252,8 @@ This will tell you where the decoder panics exactly. If you are able to fix the 
 # Contributing
 
 Issues and pull requests for this fork go to <https://github.com/gpt-cmdr/zstd-rs>. Contributions are published
-under the same MIT license as this project. Please make an entry in the Changelog.md file when you make a PR.
+under the MIT License. Files with code adapted from Zstandard stay under its BSD license as well
+(see License below); code adapted from Zstandard has to be marked so, in the file's SPDX header and in NOTICE. Please make an entry in the Changelog.md file when you make a PR.
 
 ## License
 

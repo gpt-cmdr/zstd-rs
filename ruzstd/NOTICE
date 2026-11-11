@@ -8,23 +8,25 @@ Parts of zstd-rust are adapted from Zstandard (https://github.com/facebook/zstd)
 implementation of the format, which is licensed under the BSD license below (or GPLv2; this fork
 uses it under the BSD license). Those parts are therefore under the MIT License and the BSD
 license together (SPDX: MIT AND BSD-3-Clause). The files with code adapted from Zstandard start
-with SPDX headers that name the Zstandard sources they follow:
+with SPDX headers that name the Zstandard sources they follow (paths in this package):
 
-  ruzstd/src/encoding/window_matcher.rs
+  src/encoding/window_matcher.rs
     from lib/compress/zstd_fast.c (ZSTD_compressBlock_fast_noDict_generic)
     from lib/compress/zstd_double_fast.c (ZSTD_compressBlock_doubleFast_noDict_generic)
     from lib/compress/zstd_lazy.c (the row match finder and its lazy skipping)
     from lib/compress/zstd_compress_internal.h (the hash multipliers)
     from lib/compress/clevels.h (the parameters of the levels)
-  ruzstd/src/fse/fse_encoder.rs
+  src/fse/fse_encoder.rs
     from lib/compress/fse_compress.c (FSE_optimalTableLog_internal, FSE_normalizeCount, FSE_normalizeM2, FSE_buildCTable_wksp)
     from lib/common/fse.h (FSE_initCState2, FSE_encodeSymbol)
-  ruzstd/src/huff0/huff0_decoder.rs
+  src/huff0/huff0_decoder.rs
     from lib/decompress/huf_decompress.c (the fast four-stream decoding loops and the two-symbol table)
-  ruzstd/src/decoding/direct.rs
+  src/decoding/direct.rs
     from lib/decompress/zstd_decompress_block.c (sequence decoding and execution)
-  ruzstd/src/common/cpu.rs
+  src/common/cpu.rs
     from lib/common/portability_macros.h and lib/common/cpu.h (choosing BMI2 code at run time, DYNAMIC_BMI2)
+  src/dictionary/cover.rs (the `dict_builder` feature; from ruzstd)
+    from lib/dictBuilder/cover.c (COVER_computeEpochs)
 
 Elsewhere the code is ruzstd's or written for this fork, following the format specification
 (RFC 8878), with some designs informed by Zstandard's documentation and behaviour.

@@ -25,6 +25,8 @@ with SPDX headers that name the Zstandard sources they follow:
     from lib/decompress/zstd_decompress_block.c (sequence decoding and execution)
   ruzstd/src/common/cpu.rs
     from lib/common/portability_macros.h and lib/common/cpu.h (choosing BMI2 code at run time, DYNAMIC_BMI2)
+  ruzstd/src/dictionary/cover.rs (the `dict_builder` feature; from ruzstd)
+    from lib/dictBuilder/cover.c (COVER_computeEpochs)
 
 Elsewhere the code is ruzstd's or written for this fork, following the format specification
 (RFC 8878), with some designs informed by Zstandard's documentation and behaviour.
