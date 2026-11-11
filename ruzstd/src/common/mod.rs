@@ -1,6 +1,8 @@
 //! Values and interfaces shared between the encoding side
 //! and the decoding side.
 
+pub(crate) mod cpu;
+
 // --- FRAMES ---
 /// This magic number is included at the start of a single Zstandard frame
 pub const MAGIC_NUM: u32 = 0xFD2F_B528;

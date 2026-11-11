@@ -576,14 +576,8 @@ fn decode_huffman(
                 needed: jump3,
             });
         }
-        let streams = [
-            &source[..jump1],
-            &source[jump1..jump2],
-            &source[jump2..jump3],
-            &source[jump3..],
-        ];
         table
-            .decode_four_streams(streams, target)
+            .decode_four_streams(source, [jump1, jump2, jump3], target)
             .ok_or_else(mismatch)
     } else {
         table.decode_stream(source, target).ok_or_else(mismatch)
