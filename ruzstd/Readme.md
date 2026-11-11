@@ -256,7 +256,9 @@ under the same MIT license as this project. Please make an entry in the Changelo
 
 ## License
 
-MIT, as ruzstd, and for the parts adapted from Zstandard (https://github.com/facebook/zstd) also its
-BSD license: the crate as a whole is `MIT AND BSD-3-Clause`. [NOTICE](NOTICE) lists the adapted
-files; [LICENSE](LICENSE) and [LICENSE-ZSTD](LICENSE-ZSTD) have the two license texts. Programs that
+MIT, as ruzstd, and for the parts adapted from [Zstandard](https://github.com/facebook/zstd) also its
+BSD license: the crate as a whole is `MIT AND BSD-3-Clause`.
+[NOTICE](https://github.com/gpt-cmdr/zstd-rs/blob/main/NOTICE) lists the adapted files;
+[LICENSE](https://github.com/gpt-cmdr/zstd-rs/blob/main/LICENSE) and
+[LICENSE-ZSTD](https://github.com/gpt-cmdr/zstd-rs/blob/main/LICENSE-ZSTD) have the two license texts. Programs that
 ship zstd-rust have to reproduce Zstandard's notice with their documentation.
